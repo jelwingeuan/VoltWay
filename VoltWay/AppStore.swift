@@ -144,12 +144,15 @@ final class VoltWayStore {
         }
     }
 
-    func useCurrentLocation() async {
+    @discardableResult
+    func useCurrentLocation() async -> Coordinate? {
         do {
-            currentLocation = try await locationService.requestLocation()
-            await refreshStations()
+            let location = try await locationService.requestLocation()
+            currentLocation = location
+            return location
         } catch {
             show(error)
+            return nil
         }
     }
 

@@ -40,6 +40,62 @@ struct VoltWayTests {
         #expect(stale.displayText(at: now) == "Status unavailable")
     }
 
+    @Test("Search matches station names and addresses without case or surrounding-space sensitivity")
+    func stationSearch() {
+        let solaris = station(id: "solaris", connector: .ccs2, power: 180, state: .available)
+        let valley = station(id: "valley", connector: .ccs2, power: 120, state: .occupied)
+        let stations = [solaris, valley]
+
+        #expect(StationDiscovery.visibleStations(from: stations, query: "  SOLARIS  ", availableNowOnly: false, now: now).map(\.id) == ["solaris"])
+        #expect(StationDiscovery.visibleStations(from: stations, query: "kuala lumpur", availableNowOnly: false, now: now).count == 2)
+        #expect(StationDiscovery.visibleStations(from: stations, query: "   ", availableNowOnly: false, now: now).count == 2)
+        #expect(StationDiscovery.visibleStations(from: stations, query: "no match", availableNowOnly: false, now: now).isEmpty)
+    }
+
+    @Test("Available now requires fresh status and at least one reported connector")
+    func availableNowFilter() {
+        let available = station(id: "available", connector: .ccs2, power: 180, state: .available)
+        let stale = station(id: "stale", connector: .ccs2, power: 180, state: .available, updatedAt: now.addingTimeInterval(-301))
+        let zero = station(id: "zero", connector: .ccs2, power: 180, state: .available, availableConnectors: 0)
+        let missing = station(id: "missing", connector: .ccs2, power: 180, state: .available, availableConnectors: nil)
+        let occupied = station(id: "occupied", connector: .ccs2, power: 180, state: .occupied)
+
+        let results = StationDiscovery.visibleStations(
+            from: [available, stale, zero, missing, occupied],
+            query: "",
+            availableNowOnly: true,
+            now: now
+        )
+        #expect(results.map(\.id) == ["available"])
+    }
+
+    @Test("Reported availability becomes unusable after five minutes or without a timestamp")
+    func reportedAvailabilityBoundary() {
+        let current = Availability(state: .available, availableConnectors: 1, totalConnectors: 2, lastUpdated: now.addingTimeInterval(-300))
+        let old = Availability(state: .available, availableConnectors: 1, totalConnectors: 2, lastUpdated: now.addingTimeInterval(-301))
+        let unknownTime = Availability(state: .available, availableConnectors: 1, totalConnectors: 2, lastUpdated: nil)
+
+        #expect(current.isReportedAvailable(at: now))
+        #expect(!old.isReportedAvailable(at: now))
+        #expect(!unknownTime.isReportedAvailable(at: now))
+        #expect(!current.isReportedAvailable(at: now.addingTimeInterval(1)))
+    }
+
+    @Test("Combined search and availability filters preserve the input sort order")
+    func combinedDiscoveryFilters() {
+        let first = station(id: "first", connector: .ccs2, power: 180, state: .available)
+        let second = station(id: "second", connector: .ccs2, power: 120, state: .available)
+        let other = station(id: "other", connector: .ccs2, power: 60, state: .occupied)
+
+        let results = StationDiscovery.visibleStations(
+            from: [second, other, first],
+            query: "kuala",
+            availableNowOnly: true,
+            now: now
+        )
+        #expect(results.map(\.id) == ["second", "first"])
+    }
+
     @Test("Missing and old price timestamps never imply a current price")
     func stalePrice() {
         let missing = Price(amountMYR: 1.50, unit: .kWh, lastUpdated: nil)
@@ -86,7 +142,9 @@ struct VoltWayTests {
         id: String,
         connector: ConnectorKind,
         power: Double,
-        state: AvailabilityState
+        state: AvailabilityState,
+        availableConnectors: Int? = 1,
+        updatedAt: Date? = nil
     ) -> ChargingStation {
         ChargingStation(
             id: id,
@@ -95,7 +153,7 @@ struct VoltWayTests {
             coordinate: Coordinate(latitude: 3.1390, longitude: 101.6869),
             operatorName: "Gentari",
             connectors: [Connector(kind: connector, powerKW: power, count: 2)],
-            availability: Availability(state: state, availableConnectors: state == .available ? 1 : 0, totalConnectors: 2, lastUpdated: now),
+            availability: Availability(state: state, availableConnectors: availableConnectors, totalConnectors: 2, lastUpdated: updatedAt ?? now),
             price: Price(amountMYR: 1.50, unit: .kWh, lastUpdated: now)
         )
     }

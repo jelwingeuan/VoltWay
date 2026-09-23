@@ -1,3 +1,5 @@
+import Combine
+import MapKit
 import SwiftUI
 
 struct RootView: View {
@@ -171,26 +173,102 @@ struct MainTabView: View {
 }
 
 struct DiscoverView: View {
+    private enum DisplayMode: String, CaseIterable, Identifiable {
+        case list = "List"
+        case map = "Map"
+
+        var id: Self { self }
+    }
+
     let store: VoltWayStore
     @State private var showingVehicleProfile = false
     @State private var showsDemoBanner = true
+    @State private var displayMode = DisplayMode.list
+    @State private var searchText = ""
+    @State private var availableNowOnly = false
+    @State private var selectedStationID: String?
+    @State private var mapPosition: MapCameraPosition = .automatic
+    @State private var freshnessTime = Date.now
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
+    private var visibleStations: [ChargingStation] {
+        StationDiscovery.visibleStations(
+            from: store.compatibleStations,
+            query: searchText,
+            availableNowOnly: availableNowOnly,
+            now: freshnessTime
+        )
+    }
+
+    private var selectedStation: ChargingStation? {
+        visibleStations.first { $0.id == selectedStationID }
+    }
+
+    private var accessibilityStationSelection: Binding<ChargingStation?> {
+        Binding(
+            get: { dynamicTypeSize.isAccessibilitySize && displayMode == .map ? selectedStation : nil },
+            set: { selectedStationID = $0?.id }
+        )
+    }
 
     var body: some View {
+        Group {
+            switch displayMode {
+            case .list: listContent
+            case .map: mapContent
+            }
+        }
+        .background(Color.voltBackground)
+        .navigationTitle("VoltWay")
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button("Vehicle", systemImage: "car.side") { showingVehicleProfile = true }
+                    .accessibilityLabel("Edit vehicle profile")
+            }
+        }
+        .sheet(isPresented: $showingVehicleProfile) {
+            NavigationStack { VehicleProfileView(store: store) }
+                .presentationDetents([.medium, .large])
+        }
+        .sheet(item: accessibilityStationSelection) { station in
+            NavigationStack {
+                ScrollView {
+                    StationMapPreview(station: station, store: store)
+                        .padding(20)
+                }
+                .background(Color.voltBackground)
+                .navigationTitle("Selected charger")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Done") { selectedStationID = nil }
+                    }
+                }
+            }
+            .presentationDetents([.large])
+        }
+        .onChange(of: visibleStations.map(\.id)) { _, stationIDs in
+            if let selectedStationID, !stationIDs.contains(selectedStationID) {
+                self.selectedStationID = nil
+            }
+        }
+        .onReceive(Timer.publish(every: 15, on: .main, in: .common).autoconnect()) { time in
+            freshnessTime = time
+        }
+        .task {
+            if store.stations.isEmpty && !store.profile.connectors.isEmpty { await store.refreshStations() }
+        }
+    }
+
+    private var listContent: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 20) {
-                if store.isDemoMode && showsDemoBanner {
-                    MessageBanner(
-                        message: "Demo data is active. Connect Supabase and the Gentari feed for live status.",
-                        isError: false,
-                        dismiss: { showsDemoBanner = false }
-                    )
-                }
-                if let error = store.errorMessage {
-                    MessageBanner(message: error, isError: true, dismiss: store.clearMessages)
-                }
+                messages
+
+                discoveryControls
 
                 DiscoveryHero(
-                    stationCount: store.compatibleStations.count,
+                    stationCount: visibleStations.count,
                     profileSummary: store.profileSummary,
                     hasLocation: store.currentLocation != nil,
                     isLoading: store.isLoadingStations,
@@ -205,24 +283,10 @@ struct DiscoverView: View {
                     if store.isLoadingStations { ProgressView().controlSize(.small) }
                 }
 
-                if store.profile.connectors.isEmpty {
-                    EmptyState(
-                        icon: "car.side.lock",
-                        title: "Add your EV",
-                        detail: "Choose its connectors before searching for compatible chargers.",
-                        actionTitle: "Set up vehicle",
-                        action: { showingVehicleProfile = true }
-                    )
-                } else if store.compatibleStations.isEmpty && !store.isLoadingStations {
-                    EmptyState(
-                        icon: "bolt.slash",
-                        title: "No compatible chargers",
-                        detail: "Try lowering the minimum power or changing your connector selection.",
-                        actionTitle: "Edit vehicle",
-                        action: { showingVehicleProfile = true }
-                    )
+                if hasNoResults {
+                    emptyResults
                 } else {
-                    ForEach(store.compatibleStations) { station in
+                    ForEach(visibleStations) { station in
                         NavigationLink {
                             StationDetailView(station: station, store: store)
                         } label: {
@@ -239,22 +303,233 @@ struct DiscoverView: View {
             .padding(.horizontal, 20)
             .padding(.vertical, 18)
         }
-        .background(Color.voltBackground)
-        .navigationTitle("VoltWay")
         .refreshable { await store.refreshStations() }
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Button("Vehicle", systemImage: "car.side") { showingVehicleProfile = true }
-                    .accessibilityLabel("Edit vehicle profile")
+    }
+
+    private var mapContent: some View {
+        VStack(spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    mapMessages
+                    discoveryControls
+                    HStack {
+                        Text("\(visibleStations.count) compatible chargers")
+                            .font(.subheadline.weight(.semibold))
+                        Spacer()
+                        if store.isLoadingStations { ProgressView().controlSize(.small) }
+                    }
+                }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 14)
+            }
+            .frame(maxHeight: dynamicTypeSize.isAccessibilitySize ? 370 : 380)
+
+            if hasNoResults {
+                ScrollView {
+                    emptyResults
+                        .padding(.horizontal, 20)
+                        .padding(.top, 18)
+                }
+            } else {
+                Map(position: $mapPosition, selection: $selectedStationID) {
+                    ForEach(visibleStations) { station in
+                        Marker(
+                            station.name,
+                            systemImage: "bolt.car.fill",
+                            coordinate: station.coordinate.coreLocation.coordinate
+                        )
+                        .tint(station.availability.isReportedAvailable(at: freshnessTime) ? Color.voltMint : Color.voltBlue)
+                        .tag(station.id)
+                    }
+                }
+                .mapControls { MapCompass() }
+                .overlay(alignment: .topTrailing) {
+                    Button {
+                        Task { await locateOnMap() }
+                    } label: {
+                        Label("Use my location", systemImage: "location.fill")
+                    }
+                    .labelStyle(.iconOnly)
+                    .buttonStyle(.borderedProminent)
+                    .padding(14)
+                }
+                .safeAreaInset(edge: .bottom) {
+                    if !dynamicTypeSize.isAccessibilitySize, let selectedStation {
+                        StationMapPreview(station: selectedStation, store: store)
+                            .padding(.horizontal, 14)
+                            .padding(.bottom, 8)
+                    }
+                }
             }
         }
-        .sheet(isPresented: $showingVehicleProfile) {
-            NavigationStack { VehicleProfileView(store: store) }
-                .presentationDetents([.medium, .large])
+    }
+
+    @ViewBuilder private var messages: some View {
+        if store.isDemoMode && showsDemoBanner {
+            MessageBanner(
+                message: "Demo data is active. Connect Supabase and the Gentari feed for live status.",
+                isError: false,
+                dismiss: { showsDemoBanner = false }
+            )
         }
-        .task {
-            if store.stations.isEmpty && !store.profile.connectors.isEmpty { await store.refreshStations() }
+        if let error = store.errorMessage {
+            MessageBanner(message: error, isError: true, dismiss: store.clearMessages)
         }
+    }
+
+    @ViewBuilder private var mapMessages: some View {
+        if store.isDemoMode && showsDemoBanner {
+            MessageBanner(
+                message: "Demo · not live",
+                isError: false,
+                dismiss: { showsDemoBanner = false }
+            )
+        }
+        if let error = store.errorMessage {
+            MessageBanner(message: error, isError: true, dismiss: store.clearMessages)
+        }
+    }
+
+    private var discoveryControls: some View {
+        VStack(spacing: 12) {
+            Picker("Charger view", selection: $displayMode) {
+                ForEach(DisplayMode.allCases) { mode in
+                    Text(mode.rawValue).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            HStack(spacing: 10) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+                TextField("Search name or address", text: $searchText)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .submitLabel(.search)
+                if !searchText.isEmpty {
+                    Button("Clear search", systemImage: "xmark.circle.fill") { searchText = "" }
+                        .labelStyle(.iconOnly)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(12)
+            .background(Color.voltSurface, in: .rect(cornerRadius: 14))
+
+            Toggle("Available now", isOn: $availableNowOnly)
+                .font(.subheadline.weight(.medium))
+                .accessibilityHint("Shows only chargers with a fresh available status and a positive connector count")
+        }
+    }
+
+    private var hasNoResults: Bool {
+        store.profile.connectors.isEmpty
+            || (!store.isLoadingStations && visibleStations.isEmpty)
+    }
+
+    @ViewBuilder private var emptyResults: some View {
+        if store.profile.connectors.isEmpty {
+            EmptyState(
+                icon: "car.side.lock",
+                title: "Add your EV",
+                detail: "Choose its connectors before searching for compatible chargers.",
+                actionTitle: "Set up vehicle",
+                action: { showingVehicleProfile = true }
+            )
+        } else if store.errorMessage != nil && store.stations.isEmpty {
+            EmptyState(
+                icon: "wifi.exclamationmark",
+                title: "Chargers unavailable",
+                detail: "We couldn't load chargers. Try again when you have a connection.",
+                actionTitle: "Retry",
+                action: { Task { await store.refreshStations() } }
+            )
+        } else if store.compatibleStations.isEmpty {
+            EmptyState(
+                icon: "bolt.slash",
+                title: "No compatible chargers",
+                detail: "Try lowering the minimum power or changing your connector selection.",
+                actionTitle: "Edit vehicle",
+                action: { showingVehicleProfile = true }
+            )
+        } else {
+            EmptyState(
+                icon: "magnifyingglass",
+                title: "No matching chargers",
+                detail: "Try another search or turn off Available now.",
+                actionTitle: "Clear filters",
+                action: {
+                    searchText = ""
+                    availableNowOnly = false
+                }
+            )
+        }
+    }
+
+    private func locateOnMap() async {
+        guard let location = await store.useCurrentLocation() else { return }
+        mapPosition = .region(MKCoordinateRegion(
+            center: location.coreLocation.coordinate,
+            span: MKCoordinateSpan(latitudeDelta: 0.12, longitudeDelta: 0.12)
+        ))
+    }
+}
+
+private struct StationMapPreview: View {
+    let station: ChargingStation
+    let store: VoltWayStore
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
+    var body: some View {
+        VoltSurface {
+            VStack(alignment: .leading, spacing: 12) {
+                Text(station.name)
+                    .font(.headline)
+                Text(station.address)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                if dynamicTypeSize.isAccessibilitySize {
+                    VStack(alignment: .leading, spacing: 8) {
+                        AvailabilityPill(availability: station.availability)
+                        priceText
+                    }
+                    VStack(alignment: .leading, spacing: 12) {
+                        detailsLink
+                        navigateButton
+                    }
+                } else {
+                    HStack {
+                        AvailabilityPill(availability: station.availability)
+                        Spacer(minLength: 8)
+                        priceText
+                    }
+                    HStack(spacing: 16) {
+                        detailsLink
+                        Spacer()
+                        navigateButton
+                    }
+                }
+            }
+        }
+    }
+
+    private var priceText: some View {
+        Text(station.price?.displayText() ?? "Price unavailable")
+            .font(.caption.weight(.semibold))
+    }
+
+    private var detailsLink: some View {
+        NavigationLink("Details") {
+            StationDetailView(station: station, store: store)
+        }
+        .font(.subheadline.weight(.semibold))
+    }
+
+    private var navigateButton: some View {
+        Button("Navigate with Apple Maps", systemImage: "arrow.triangle.turn.up.right.diamond") {
+            MapsHandoff.open(station)
+        }
+        .font(.subheadline.weight(.semibold))
     }
 }
 

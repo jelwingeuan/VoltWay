@@ -100,6 +100,10 @@ struct Availability: Codable, Equatable, Hashable, Sendable {
         return date.timeIntervalSince(lastUpdated) > interval
     }
 
+    func isReportedAvailable(at date: Date = .now) -> Bool {
+        state == .available && !isStale(at: date) && (availableConnectors ?? 0) > 0
+    }
+
     func displayText(at date: Date = .now) -> String {
         guard !isStale(at: date) else { return "Status unavailable" }
         if state == .available, let availableConnectors {
@@ -202,6 +206,22 @@ enum StationDiscovery {
                 if lhsDistance != rhsDistance { return lhsDistance < rhsDistance }
                 return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
             }
+    }
+
+    static func visibleStations(
+        from stations: [ChargingStation],
+        query: String,
+        availableNowOnly: Bool,
+        now: Date = .now
+    ) -> [ChargingStation] {
+        let search = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        return stations.filter { station in
+            let matchesSearch = search.isEmpty
+                || station.name.localizedStandardContains(search)
+                || station.address.localizedStandardContains(search)
+            let matchesAvailability = !availableNowOnly || station.availability.isReportedAvailable(at: now)
+            return matchesSearch && matchesAvailability
+        }
     }
 }
 
