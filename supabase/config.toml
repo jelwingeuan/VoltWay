@@ -1,0 +1,2 @@
+[functions.stations]
+verify_jwt = true
