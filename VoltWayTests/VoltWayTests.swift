@@ -108,6 +108,57 @@ struct VoltWayTests {
         #expect(current.displayText(at: now).contains("1.50"))
     }
 
+    @Test("Energy estimates use only fresh per-kWh MYR prices and round to cents")
+    func chargingCostEstimates() {
+        let price = Price(amountMYR: Decimal(string: "1.237")!, unit: .kWh, lastUpdated: now)
+        #expect(ChargingCostEstimate.amount(for: price, energyKWh: 10, at: now) == Decimal(string: "12.37"))
+        #expect(ChargingCostEstimate.amount(for: price, energyKWh: 20, at: now) == Decimal(string: "24.74"))
+        #expect(ChargingCostEstimate.amount(for: price, energyKWh: 40, at: now) == Decimal(string: "49.48"))
+        let halfCent = Price(amountMYR: Decimal(string: "1.2345")!, unit: .kWh, lastUpdated: now)
+        #expect(ChargingCostEstimate.amount(for: halfCent, energyKWh: 10, at: now) == Decimal(string: "12.35"))
+        #expect(ChargingCostEstimate.amount(for: price, energyKWh: 0, at: now) == nil)
+        #expect(ChargingCostEstimate.amount(for: price, energyKWh: -1, at: now) == nil)
+    }
+
+    @Test("Missing, stale, and non-energy tariffs cannot produce an estimate")
+    func unavailableChargingEstimates() {
+        let missingTime = Price(amountMYR: 1.50, unit: .kWh, lastUpdated: nil)
+        let stale = Price(amountMYR: 1.50, unit: .kWh, lastUpdated: now.addingTimeInterval(-86_401))
+        let perMinute = Price(amountMYR: 0.50, unit: .minute, lastUpdated: now)
+        let perSession = Price(amountMYR: 5, unit: .session, lastUpdated: now)
+
+        #expect(ChargingCostEstimate.amount(for: nil, energyKWh: 20, at: now) == nil)
+        #expect(ChargingCostEstimate.amount(for: missingTime, energyKWh: 20, at: now) == nil)
+        #expect(ChargingCostEstimate.amount(for: stale, energyKWh: 20, at: now) == nil)
+        #expect(ChargingCostEstimate.amount(for: perMinute, energyKWh: 20, at: now) == nil)
+        #expect(ChargingCostEstimate.amount(for: perSession, energyKWh: 20, at: now) == nil)
+    }
+
+    @Test("Route stops use compatible chargers, an inclusive corridor, and travel order")
+    func routeStops() throws {
+        let profile = VehicleProfile(connectors: [.ccs2], minimumPowerKW: 50)
+        let route = [Coordinate(latitude: 3, longitude: 101), Coordinate(latitude: 3, longitude: 102)]
+        let first = station(id: "first", connector: .ccs2, power: 100, state: .available,
+                            coordinate: Coordinate(latitude: 3.01, longitude: 101.2))
+        let second = station(id: "second", connector: .ccs2, power: 100, state: .available,
+                             coordinate: Coordinate(latitude: 3.044, longitude: 101.8))
+        let boundaryLatitude = 3.0 + 5_000.0 / 111_195.0
+        let boundary = station(id: "boundary", connector: .ccs2, power: 100, state: .available,
+                               coordinate: Coordinate(latitude: boundaryLatitude, longitude: 101.5))
+        let outside = station(id: "outside", connector: .ccs2, power: 100, state: .available,
+                             coordinate: Coordinate(latitude: 3.0 + 5_100.0 / 111_195.0, longitude: 101.5))
+        let incompatible = station(id: "incompatible", connector: .type2, power: 100, state: .available,
+                                  coordinate: Coordinate(latitude: 3, longitude: 101.3))
+        let compatible = StationDiscovery.compatibleStations(
+            from: [second, boundary, outside, incompatible, first], profile: profile, near: nil, now: now
+        )
+
+        let stops = RouteStopMatcher.stops(along: route, compatibleStations: compatible, corridorMeters: 5_000)
+        #expect(stops.map { $0.station.id } == ["first", "boundary", "second"])
+        #expect(try #require(stops.first).offRouteMeters < 1_200)
+        #expect(try #require(stops.first).routeProgressMeters < stops[1].routeProgressMeters)
+    }
+
     @Test("CarPlay does not fabricate stations after its snapshot is cleared")
     @MainActor func clearedCarPlaySnapshot() throws {
         let defaults = try #require(UserDefaults(suiteName: "VoltWayTests.\(UUID().uuidString)"))
@@ -144,13 +195,14 @@ struct VoltWayTests {
         power: Double,
         state: AvailabilityState,
         availableConnectors: Int? = 1,
-        updatedAt: Date? = nil
+        updatedAt: Date? = nil,
+        coordinate: Coordinate = Coordinate(latitude: 3.1390, longitude: 101.6869)
     ) -> ChargingStation {
         ChargingStation(
             id: id,
             name: id.capitalized,
             address: "Kuala Lumpur",
-            coordinate: Coordinate(latitude: 3.1390, longitude: 101.6869),
+            coordinate: coordinate,
             operatorName: "Gentari",
             connectors: [Connector(kind: connector, powerKW: power, count: 2)],
             availability: Availability(state: state, availableConnectors: availableConnectors, totalConnectors: 2, lastUpdated: updatedAt ?? now),

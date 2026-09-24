@@ -490,7 +490,7 @@ enum LocationError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .permissionDenied: "Location access is off. Enable it in Settings to sort nearby chargers."
+        case .permissionDenied: "Location access is off. Enable it in Settings to use location-dependent features."
         case .unavailable: "Your current location is unavailable."
         }
     }

@@ -144,6 +144,84 @@ struct Price: Codable, Equatable, Hashable, Sendable {
     }
 }
 
+enum ChargingCostEstimate {
+    static func amount(for price: Price?, energyKWh: Int, at date: Date = .now) -> Decimal? {
+        guard let price,
+              energyKWh > 0,
+              price.unit == .kWh,
+              price.amountMYR > 0,
+              !price.isStale(at: date)
+        else { return nil }
+
+        var product = price.amountMYR * Decimal(energyKWh)
+        var rounded = Decimal()
+        NSDecimalRound(&rounded, &product, 2, .plain)
+        return rounded
+    }
+}
+
+struct RouteStopCandidate: Equatable, Sendable {
+    let station: ChargingStation
+    let offRouteMeters: Double
+    let routeProgressMeters: Double
+}
+
+enum RouteStopMatcher {
+    // ponytail: a local equirectangular projection is accurate enough for the 5 km Malaysia pilot corridor.
+    static func stops(
+        along route: [Coordinate],
+        compatibleStations: [ChargingStation],
+        corridorMeters: Double = 5_000
+    ) -> [RouteStopCandidate] {
+        guard !route.isEmpty, corridorMeters >= 0 else { return [] }
+        return compatibleStations.compactMap { station in
+            guard let match = nearestPoint(to: station.coordinate, on: route), match.distance <= corridorMeters else { return nil }
+            return RouteStopCandidate(station: station, offRouteMeters: match.distance, routeProgressMeters: match.progress)
+        }
+        .sorted {
+            if $0.routeProgressMeters != $1.routeProgressMeters { return $0.routeProgressMeters < $1.routeProgressMeters }
+            return $0.station.id < $1.station.id
+        }
+    }
+
+    private static func nearestPoint(to coordinate: Coordinate, on route: [Coordinate]) -> (distance: Double, progress: Double)? {
+        let earthRadius = 6_371_000.0
+        guard route.count > 1 else {
+            let point = route[0]
+            return (point.coreLocation.distance(from: coordinate.coreLocation), 0)
+        }
+
+        var routeProgress = 0.0
+        var nearest: (distance: Double, progress: Double)?
+        for index in 0..<(route.count - 1) {
+            let start = route[index]
+            let end = route[index + 1]
+            let meanLatitude = (start.latitude + end.latitude + coordinate.latitude) / 3 * .pi / 180
+            func point(_ value: Coordinate) -> (x: Double, y: Double) {
+                (value.longitude * .pi / 180 * earthRadius * cos(meanLatitude), value.latitude * .pi / 180 * earthRadius)
+            }
+            let a = point(start)
+            let b = point(end)
+            let p = point(coordinate)
+            let dx = b.x - a.x
+            let dy = b.y - a.y
+            let segmentLength = hypot(dx, dy)
+            let fraction = segmentLength == 0 ? 0 : min(1, max(0, ((p.x - a.x) * dx + (p.y - a.y) * dy) / (segmentLength * segmentLength)))
+            let projectedX = a.x + fraction * dx
+            let projectedY = a.y + fraction * dy
+            let distance = hypot(p.x - projectedX, p.y - projectedY)
+            let progress = routeProgress + fraction * segmentLength
+            if let current = nearest {
+                if distance < current.distance { nearest = (distance, progress) }
+            } else {
+                nearest = (distance, progress)
+            }
+            routeProgress += segmentLength
+        }
+        return nearest
+    }
+}
+
 struct ChargingStation: Codable, Equatable, Hashable, Identifiable, Sendable {
     let id: String
     let name: String

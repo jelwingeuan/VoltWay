@@ -225,6 +225,13 @@ struct DiscoverView: View {
                 Button("Vehicle", systemImage: "car.side") { showingVehicleProfile = true }
                     .accessibilityLabel("Edit vehicle profile")
             }
+            ToolbarItem(placement: .topBarLeading) {
+                NavigationLink {
+                    TripPlannerView(store: store)
+                } label: {
+                    Label("Plan a trip", systemImage: "point.topleft.down.to.point.bottomright.curvepath")
+                }
+            }
         }
         .sheet(isPresented: $showingVehicleProfile) {
             NavigationStack { VehicleProfileView(store: store) }
@@ -572,7 +579,7 @@ struct DiscoveryHero: View {
                 HStack(spacing: 12) { heroActions }
             }
 
-            Label("Location is used in memory only and is never saved.", systemImage: "lock.fill")
+            Label("VoltWay does not save your location or include it in charger requests.", systemImage: "lock.fill")
                 .font(.caption)
                 .foregroundStyle(.white.opacity(0.66))
         }
@@ -680,6 +687,7 @@ struct StationRow: View {
 struct StationDetailView: View {
     let station: ChargingStation
     let store: VoltWayStore
+    @State private var selectedEnergyKWh = 20
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     private var isFavorite: Bool { store.favoriteStationIDs.contains(station.id) }
@@ -689,6 +697,7 @@ struct StationDetailView: View {
             VStack(alignment: .leading, spacing: 20) {
                 detailHeader
                 statusCard
+                costEstimateCard
                 connectorCard
                 Button {
                     MapsHandoff.open(station)
@@ -772,6 +781,65 @@ struct StationDetailView: View {
         }
     }
 
+    private var costEstimateCard: some View {
+        let estimate = ChargingCostEstimate.amount(for: station.price, energyKWh: selectedEnergyKWh)
+        return VoltSurface {
+            VStack(alignment: .leading, spacing: 14) {
+                Text("Energy cost estimate")
+                    .font(.headline)
+                energyPicker
+
+                if let estimate {
+                    let priceText = station.price?.displayText() ?? "Price unavailable"
+                    Text(estimate.formatted(.currency(code: "MYR").precision(.fractionLength(2))))
+                        .font(.system(.title2, design: .rounded).weight(.bold))
+                        .contentTransition(.numericText())
+                    Text("For \(selectedEnergyKWh) kWh at \(priceText). Energy only; excludes fees and does not estimate your battery’s state of charge.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("Estimate unavailable")
+                        .font(.title3.weight(.semibold))
+                    Text(estimateUnavailableReason)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .animation(.default, value: selectedEnergyKWh)
+    }
+
+    @ViewBuilder private var energyPicker: some View {
+        if dynamicTypeSize.isAccessibilitySize {
+            Menu {
+                ForEach([10, 20, 40], id: \.self) { amount in
+                    Button("\(amount) kWh") { selectedEnergyKWh = amount }
+                }
+            } label: {
+                Label("\(selectedEnergyKWh) kWh", systemImage: "bolt")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.bordered)
+            .accessibilityLabel("Energy amount, \(selectedEnergyKWh) kilowatt-hours")
+        } else {
+            Picker("Energy amount", selection: $selectedEnergyKWh) {
+                ForEach([10, 20, 40], id: \.self) { amount in
+                    Text("\(amount) kWh").tag(amount)
+                }
+            }
+            .pickerStyle(.segmented)
+            .accessibilityHint("Choose an energy amount to estimate its cost")
+        }
+    }
+
+    private var estimateUnavailableReason: String {
+        guard let price = station.price else { return "A current MYR per-kWh price has not been reported." }
+        guard price.unit == .kWh else { return "This charger reports a per-\(price.unit == .minute ? "minute" : "session") price, so an energy-only estimate cannot be calculated." }
+        guard !price.isStale() else { return "The reported per-kWh price is missing its update time or is older than 24 hours." }
+        return "A valid per-kWh price is unavailable."
+    }
+
     private var priceLabel: some View {
         Text(station.price?.displayText() ?? "Price unavailable")
             .font(.headline)
@@ -781,6 +849,318 @@ struct StationDetailView: View {
     private func updateText(_ field: String, at date: Date?) -> String {
         guard let date else { return "\(field) update time unavailable" }
         return "\(field) updated \(date.formatted(.relative(presentation: .named)))"
+    }
+}
+
+private struct TripDestination: Identifiable, Hashable {
+    let name: String
+    let address: String
+    let coordinate: Coordinate
+
+    var id: String { "\(name)|\(coordinate.latitude)|\(coordinate.longitude)" }
+}
+
+struct TripPlannerView: View {
+    let store: VoltWayStore
+    @State private var destinationQuery = ""
+    @State private var destinations: [TripDestination] = []
+    @State private var selectedDestination: TripDestination?
+    @State private var isSearching = false
+    @State private var isPlanning = false
+    @State private var routeCoordinates: [Coordinate] = []
+    @State private var routeStops: [RouteStopCandidate] = []
+    @State private var routeDistanceMeters: Double?
+    @State private var routeTravelTime: TimeInterval?
+    @State private var routeMessage: String?
+    @State private var searchMessage: String?
+    @State private var selectedStationID: String?
+    @State private var cameraPosition: MapCameraPosition = .automatic
+    @State private var showingVehicleProfile = false
+
+    private var selectedStation: ChargingStation? {
+        routeStops.first { $0.station.id == selectedStationID }?.station
+    }
+
+    private var selectedStationBinding: Binding<ChargingStation?> {
+        Binding(get: { selectedStation }, set: { selectedStationID = $0?.id })
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                intro
+                if store.isDemoMode {
+                    Label("Demo charger data · not live", systemImage: "info.circle.fill")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(Color.voltBlue)
+                        .padding(.vertical, 4)
+                }
+                if let error = store.errorMessage {
+                    MessageBanner(message: error, isError: true, dismiss: store.clearMessages)
+                }
+                destinationSearch
+                if let searchMessage { MessageBanner(message: searchMessage, isError: true, dismiss: { self.searchMessage = nil }) }
+                if !destinations.isEmpty { destinationResults }
+                if let selectedDestination { chosenDestination(selectedDestination) }
+                if let routeMessage { MessageBanner(message: routeMessage, isError: true, dismiss: { self.routeMessage = nil }) }
+                if !routeCoordinates.isEmpty { routeResults }
+            }
+            .padding(20)
+        }
+        .background(Color.voltBackground)
+        .navigationTitle("Plan a trip")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button("Vehicle", systemImage: "car.side") { showingVehicleProfile = true }
+                    .accessibilityLabel("Edit vehicle profile")
+            }
+        }
+        .sheet(isPresented: $showingVehicleProfile) {
+            NavigationStack { VehicleProfileView(store: store) }
+                .presentationDetents([.medium, .large])
+        }
+        .sheet(item: selectedStationBinding) { station in
+            NavigationStack { StationDetailView(station: station, store: store) }
+        }
+    }
+
+    private var intro: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("CHARGERS ALONG YOUR DRIVE")
+                .font(.caption.weight(.bold))
+                .tracking(1)
+                .foregroundStyle(Color.voltBlue)
+            Text("Plan a trip")
+                .font(.system(.largeTitle, design: .rounded).weight(.bold))
+            Text("Choose a destination, then use your current location to find compatible chargers near the recommended driving route.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+            Label("VoltWay doesn’t save trip details. Apple MapKit processes your location and destination for routing.", systemImage: "lock.fill")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var destinationSearch: some View {
+        VoltSurface {
+            VStack(alignment: .leading, spacing: 12) {
+                TextField("Search a destination", text: $destinationQuery)
+                    .textContentType(.fullStreetAddress)
+                    .textInputAutocapitalization(.words)
+                    .submitLabel(.search)
+                    .onSubmit { Task { await searchDestinations() } }
+                Button {
+                    Task { await searchDestinations() }
+                } label: {
+                    if isSearching { ProgressView().frame(maxWidth: .infinity) }
+                    else { Label("Search destination", systemImage: "magnifyingglass").frame(maxWidth: .infinity) }
+                }
+                .buttonStyle(VoltPrimaryButtonStyle())
+                .disabled(isSearching || destinationQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+    }
+
+    private var destinationResults: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Choose a destination")
+                .font(.headline)
+            ForEach(destinations) { destination in
+                Button {
+                    selectedDestination = destination
+                    routeCoordinates = []
+                    routeStops = []
+                    routeMessage = nil
+                } label: {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(destination.name).font(.headline).foregroundStyle(.primary)
+                        Text(destination.address).font(.subheadline).foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(14)
+                    .background(Color.voltSurface, in: .rect(cornerRadius: 16))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    private func chosenDestination(_ destination: TripDestination) -> some View {
+        VoltSurface {
+            VStack(alignment: .leading, spacing: 12) {
+                Label("Destination", systemImage: "mappin.and.ellipse")
+                    .font(.headline)
+                Text(destination.name).font(.title3.weight(.semibold))
+                Text(destination.address).font(.subheadline).foregroundStyle(.secondary)
+                Button {
+                    Task { await planRoute(to: destination) }
+                } label: {
+                    if isPlanning || store.isLoadingStations { ProgressView().frame(maxWidth: .infinity) }
+                    else { Label("Find chargers along route", systemImage: "point.topleft.down.to.point.bottomright.curvepath").frame(maxWidth: .infinity) }
+                }
+                .buttonStyle(VoltPrimaryButtonStyle())
+                .disabled(isPlanning || store.isLoadingStations || store.profile.connectors.isEmpty)
+                if store.isLoadingStations {
+                    Text("Loading compatible chargers…").font(.caption).foregroundStyle(.secondary)
+                }
+                if store.profile.connectors.isEmpty {
+                    Button("Set up vehicle connectors") { showingVehicleProfile = true }
+                        .font(.subheadline.weight(.semibold))
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private var routeResults: some View {
+        if let routeDistanceMeters, let routeTravelTime {
+            VStack(alignment: .leading, spacing: 14) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Recommended driving route").font(.title2.weight(.bold))
+                    Text("\((routeDistanceMeters / 1_000).formatted(.number.precision(.fractionLength(0)))) km · \(Int((routeTravelTime / 60).rounded())) min")
+                        .font(.subheadline).foregroundStyle(.secondary)
+                }
+                routeMap
+                    .frame(height: 300)
+                    .clipShape(.rect(cornerRadius: 22))
+                Text("Compatible chargers within 5 km of route")
+                    .font(.title3.weight(.bold))
+                if routeStops.isEmpty {
+                    EmptyState(
+                        icon: "bolt.slash",
+                        title: "No chargers along this route",
+                        detail: "No compatible stations were found within 5 km of the recommended route.",
+                        actionTitle: nil,
+                        action: nil
+                    )
+                } else {
+                    ForEach(routeStops, id: \.station.id) { stop in
+                        NavigationLink {
+                            StationDetailView(station: stop.station, store: store)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 7) {
+                                StationRow(station: stop.station, distance: nil, isFavorite: store.favoriteStationIDs.contains(stop.station.id))
+                                Label("\(distanceText(stop.offRouteMeters)) from route", systemImage: "arrow.turn.up.right")
+                                    .font(.caption.weight(.medium))
+                                    .foregroundStyle(.secondary)
+                                    .padding(.leading, 10)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                Text("Stations are listed in travel order. Off-route distance is measured to the route geometry, not a road detour.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var routeMap: some View {
+        Map(position: $cameraPosition, selection: $selectedStationID) {
+            if routeCoordinates.count > 1 {
+                MapPolyline(coordinates: routeCoordinates.map { CLLocationCoordinate2D(latitude: $0.latitude, longitude: $0.longitude) })
+                    .stroke(Color.voltBlue, lineWidth: 5)
+            }
+            if let first = routeCoordinates.first {
+                Marker("Start", systemImage: "location.fill", coordinate: CLLocationCoordinate2D(latitude: first.latitude, longitude: first.longitude))
+                    .tint(.green)
+            }
+            if let last = routeCoordinates.last {
+                Marker("Destination", systemImage: "mappin.and.ellipse", coordinate: CLLocationCoordinate2D(latitude: last.latitude, longitude: last.longitude))
+                    .tint(.red)
+            }
+            ForEach(routeStops, id: \.station.id) { stop in
+                Marker(stop.station.name, systemImage: "bolt.car.fill", coordinate: CLLocationCoordinate2D(latitude: stop.station.coordinate.latitude, longitude: stop.station.coordinate.longitude))
+                    .tint(Color.voltMint)
+                    .tag(stop.station.id)
+            }
+        }
+        .mapControls { MapCompass() }
+        .accessibilityLabel("Recommended route with \(routeStops.count) compatible charger stops")
+    }
+
+    private func searchDestinations() async {
+        let query = destinationQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return }
+        isSearching = true
+        searchMessage = nil
+        destinations = []
+        defer { isSearching = false }
+
+        let request = MKLocalSearch.Request()
+        request.naturalLanguageQuery = query
+        request.region = MKCoordinateRegion(
+            center: CLLocationCoordinate2D(latitude: 4.2, longitude: 102.0),
+            span: MKCoordinateSpan(latitudeDelta: 8, longitudeDelta: 8)
+        )
+        do {
+            let response = try await MKLocalSearch(request: request).start()
+            destinations = response.mapItems.compactMap { item in
+                guard let name = item.name else { return nil }
+                let coordinate = item.placemark.coordinate
+                guard (0.8...7.5).contains(coordinate.latitude), (99.5...119.8).contains(coordinate.longitude) else { return nil }
+                return TripDestination(
+                    name: name,
+                    address: item.placemark.title ?? "Malaysia",
+                    coordinate: Coordinate(latitude: coordinate.latitude, longitude: coordinate.longitude)
+                )
+            }
+            if destinations.isEmpty { searchMessage = "No matching destinations were found. Try another place name or address." }
+        } catch {
+            searchMessage = "Destination search failed. Check your connection and try again."
+        }
+    }
+
+    private func planRoute(to destination: TripDestination) async {
+        isPlanning = true
+        routeMessage = nil
+        routeCoordinates = []
+        routeStops = []
+        routeDistanceMeters = nil
+        routeTravelTime = nil
+        defer { isPlanning = false }
+
+        guard let origin = await store.useCurrentLocation() else {
+            routeMessage = "Location is unavailable or denied. Allow location access in Settings to plan this trip."
+            return
+        }
+
+        let request = MKDirections.Request()
+        request.source = MKMapItem(placemark: MKPlacemark(coordinate: CLLocationCoordinate2D(latitude: origin.latitude, longitude: origin.longitude)))
+        request.destination = MKMapItem(placemark: MKPlacemark(coordinate: CLLocationCoordinate2D(latitude: destination.coordinate.latitude, longitude: destination.coordinate.longitude)))
+        request.transportType = .automobile
+        do {
+            let response = try await MKDirections(request: request).calculate()
+            guard let route = response.routes.first else {
+                routeMessage = "No driving route was found between your location and the selected destination."
+                return
+            }
+            var coordinates = Array(repeating: CLLocationCoordinate2D(), count: route.polyline.pointCount)
+            route.polyline.getCoordinates(&coordinates, range: NSRange(location: 0, length: route.polyline.pointCount))
+            routeCoordinates = coordinates.map { Coordinate(latitude: $0.latitude, longitude: $0.longitude) }
+            routeStops = RouteStopMatcher.stops(along: routeCoordinates, compatibleStations: store.compatibleStations)
+            routeDistanceMeters = route.distance
+            routeTravelTime = route.expectedTravelTime
+            cameraPosition = .region(routeRegion(for: routeCoordinates))
+        } catch {
+            routeMessage = "No route could be calculated. Check your connection or choose another destination."
+        }
+    }
+
+    private func routeRegion(for coordinates: [Coordinate]) -> MKCoordinateRegion {
+        let latitudes = coordinates.map(\.latitude)
+        let longitudes = coordinates.map(\.longitude)
+        let latitudeSpan = max((latitudes.max() ?? 0) - (latitudes.min() ?? 0), 0.025) * 1.3
+        let longitudeSpan = max((longitudes.max() ?? 0) - (longitudes.min() ?? 0), 0.025) * 1.3
+        return MKCoordinateRegion(
+            center: CLLocationCoordinate2D(latitude: ((latitudes.max() ?? 0) + (latitudes.min() ?? 0)) / 2, longitude: ((longitudes.max() ?? 0) + (longitudes.min() ?? 0)) / 2),
+            span: MKCoordinateSpan(latitudeDelta: latitudeSpan, longitudeDelta: longitudeSpan)
+        )
+    }
+
+    private func distanceText(_ meters: Double) -> String {
+        meters < 1_000 ? "\(Int(meters.rounded())) m" : "\((meters / 1_000).formatted(.number.precision(.fractionLength(1)))) km"
     }
 }
 
