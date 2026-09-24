@@ -2,10 +2,21 @@ import SwiftUI
 
 extension Color {
     static let voltBlue = Color(red: 0.10, green: 0.34, blue: 0.95)
-    static let voltMint = Color(red: 0.18, green: 0.78, blue: 0.59)
-    static let voltInk = Color(red: 0.04, green: 0.08, blue: 0.16)
-    static let voltBackground = Color(uiColor: .systemGroupedBackground)
-    static let voltSurface = Color(uiColor: .secondarySystemGroupedBackground)
+    static let voltMint = Color(uiColor: UIColor { traits in
+        traits.userInterfaceStyle == .dark
+            ? UIColor(red: 0.29, green: 0.85, blue: 0.66, alpha: 1)
+            : UIColor(red: 0.04, green: 0.43, blue: 0.32, alpha: 1)
+    })
+    static let voltBackground = Color(uiColor: UIColor { traits in
+        traits.userInterfaceStyle == .dark
+            ? UIColor(red: 0.055, green: 0.09, blue: 0.15, alpha: 1)
+            : UIColor(red: 0.95, green: 0.97, blue: 0.99, alpha: 1)
+    })
+    static let voltSurface = Color(uiColor: UIColor { traits in
+        traits.userInterfaceStyle == .dark
+            ? UIColor(red: 0.10, green: 0.15, blue: 0.23, alpha: 1)
+            : UIColor.white
+    })
 }
 
 struct VoltSurface<Content: View>: View {
@@ -18,12 +29,7 @@ struct VoltSurface<Content: View>: View {
     var body: some View {
         content
             .padding(18)
-            .background(Color.voltSurface)
-            .clipShape(.rect(cornerRadius: 22))
-            .overlay {
-                RoundedRectangle(cornerRadius: 22)
-                    .stroke(Color.primary.opacity(0.07), lineWidth: 1)
-            }
+            .background(Color.voltSurface, in: .rect(cornerRadius: 18))
     }
 }
 
@@ -76,7 +82,7 @@ struct AvailabilityPill: View {
     private var tint: Color {
         if availability.isStale() { return .secondary }
         return switch availability.state {
-        case .available: .voltMint
+        case .available: availability.isReportedAvailable() ? .voltMint : .secondary
         case .occupied: .orange
         case .offline: .red
         case .unknown: .secondary
@@ -105,7 +111,7 @@ struct MessageBanner: View {
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
             Image(systemName: isError ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
-                .foregroundStyle(isError ? Color.orange : Color.voltMint)
+                .foregroundStyle(isError ? Color.orange : Color.voltBlue)
                 .accessibilityHidden(true)
             Text(message)
                 .font(.subheadline)
@@ -115,7 +121,7 @@ struct MessageBanner: View {
                 .frame(minWidth: 44, minHeight: 44)
         }
         .padding(14)
-        .background(.thinMaterial, in: .rect(cornerRadius: 16))
+        .background(Color.voltSurface, in: .rect(cornerRadius: 16))
         .accessibilityElement(children: .contain)
     }
 }

@@ -23,7 +23,7 @@
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>VoltWay uses your location while the app is open to sort nearby compatible chargers. Your location is not stored.</string>
+	<string>Use your location when you choose to recenter chargers or plan a route. VoltWay does not store it.</string>
 	<key>SUPABASE_ANON_KEY</key>
 	<string>$(SUPABASE_ANON_KEY)</string>
 	<key>SUPABASE_URL</key>

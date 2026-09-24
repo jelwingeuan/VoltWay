@@ -39,7 +39,7 @@ struct AuthenticationView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 28) {
-                Spacer(minLength: 48)
+                Spacer(minLength: 28)
                 brand
                 credentials
                 messages
@@ -55,57 +55,55 @@ struct AuthenticationView: View {
             .padding(.horizontal, 24)
             .padding(.bottom, 32)
         }
-        .background(background)
+        .background(Color.voltBackground)
         .onSubmit(submit)
     }
 
     private var brand: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 20)
-                    .fill(Color.voltBlue.gradient)
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(spacing: 12) {
                 Image(systemName: "bolt.car.fill")
-                    .font(.system(size: 32, weight: .bold))
+                    .font(.title2.weight(.bold))
                     .foregroundStyle(.white)
+                    .frame(width: 52, height: 52)
+                    .background(Color.voltBlue, in: .rect(cornerRadius: 16))
+                Text("VoltWay")
+                    .font(.title2.weight(.bold))
             }
-            .frame(width: 68, height: 68)
-            .accessibilityHidden(true)
-
-            Text("VoltWay")
+            Text("Find your next charge.")
                 .font(.system(.largeTitle, design: .rounded).weight(.bold))
-            Text("Find a compatible charger. Know its status. Keep moving.")
-                .font(.title3)
+            Text("Compatible chargers, clear status, and a route when you need one.")
+                .font(.body)
                 .foregroundStyle(.secondary)
         }
     }
 
     private var credentials: some View {
-        VoltSurface {
-            VStack(spacing: 18) {
-                Picker("Account action", selection: $mode) {
-                    ForEach(Mode.allCases) { mode in Text(mode.rawValue).tag(mode) }
-                }
-                .pickerStyle(.segmented)
+        VStack(alignment: .leading, spacing: 18) {
+            Picker("Account action", selection: $mode) {
+                ForEach(Mode.allCases) { mode in Text(mode.rawValue).tag(mode) }
+            }
+            .pickerStyle(.segmented)
 
-                TextField("Email", text: $email)
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Email").font(.subheadline.weight(.semibold))
+                TextField("name@example.com", text: $email)
                     .textContentType(.emailAddress)
                     .textInputAutocapitalization(.never)
                     .keyboardType(.emailAddress)
+                    .textFieldStyle(.roundedBorder)
                     .focused($focusedField, equals: .email)
                     .submitLabel(.next)
                     .onSubmit { focusedField = .password }
+            }
 
-                Divider()
-
-                SecureField("Password", text: $password)
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Password").font(.subheadline.weight(.semibold))
+                SecureField("At least 8 characters", text: $password)
                     .textContentType(mode == .signIn ? .password : .newPassword)
+                    .textFieldStyle(.roundedBorder)
                     .focused($focusedField, equals: .password)
                     .submitLabel(.go)
-
-                Text("Use at least 8 characters.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
     }
@@ -132,18 +130,6 @@ struct AuthenticationView: View {
         .disabled(store.isAuthenticating)
     }
 
-    private var background: some View {
-        ZStack {
-            Color.voltBackground
-            Circle()
-                .fill(Color.voltBlue.opacity(0.17))
-                .frame(width: 360, height: 360)
-                .blur(radius: 50)
-                .offset(x: 150, y: -280)
-        }
-        .ignoresSafeArea()
-    }
-
     private func submit() {
         focusedField = nil
         Task {
@@ -157,17 +143,44 @@ struct AuthenticationView: View {
 
 struct MainTabView: View {
     let store: VoltWayStore
+    @State private var showingAccount = false
 
     var body: some View {
         TabView {
-            NavigationStack { DiscoverView(store: store) }
-                .tabItem { Label("Chargers", systemImage: "bolt.car") }
+            NavigationStack {
+                DiscoverView(store: store)
+                    .toolbar { accountButton }
+            }
+            .tabItem { Label("Explore", systemImage: "map") }
 
-            NavigationStack { FavoritesView(store: store) }
-                .tabItem { Label("Saved", systemImage: "heart") }
+            NavigationStack {
+                TripPlannerView(store: store)
+                    .toolbar { accountButton }
+            }
+            .tabItem { Label("Trip", systemImage: "point.topleft.down.to.point.bottomright.curvepath") }
 
-            NavigationStack { AccountView(store: store) }
-                .tabItem { Label("Account", systemImage: "person.crop.circle") }
+            NavigationStack {
+                FavoritesView(store: store)
+                    .toolbar { accountButton }
+            }
+            .tabItem { Label("Saved", systemImage: "heart") }
+        }
+        .sheet(isPresented: $showingAccount) {
+            NavigationStack {
+                AccountView(store: store)
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Done") { showingAccount = false }
+                        }
+                    }
+            }
+        }
+    }
+
+    @ToolbarContentBuilder private var accountButton: some ToolbarContent {
+        ToolbarItem(placement: .topBarTrailing) {
+            Button("Account", systemImage: "person.crop.circle") { showingAccount = true }
+                .accessibilityLabel("Account and vehicle")
         }
     }
 }
@@ -182,8 +195,7 @@ struct DiscoverView: View {
 
     let store: VoltWayStore
     @State private var showingVehicleProfile = false
-    @State private var showsDemoBanner = true
-    @State private var displayMode = DisplayMode.list
+    @State private var displayMode = DisplayMode.map
     @State private var searchText = ""
     @State private var availableNowOnly = false
     @State private var selectedStationID: String?
@@ -219,20 +231,8 @@ struct DiscoverView: View {
             }
         }
         .background(Color.voltBackground)
-        .navigationTitle("VoltWay")
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Button("Vehicle", systemImage: "car.side") { showingVehicleProfile = true }
-                    .accessibilityLabel("Edit vehicle profile")
-            }
-            ToolbarItem(placement: .topBarLeading) {
-                NavigationLink {
-                    TripPlannerView(store: store)
-                } label: {
-                    Label("Plan a trip", systemImage: "point.topleft.down.to.point.bottomright.curvepath")
-                }
-            }
-        }
+        .navigationTitle("Explore")
+        .navigationBarTitleDisplayMode(.inline)
         .sheet(isPresented: $showingVehicleProfile) {
             NavigationStack { VehicleProfileView(store: store) }
                 .presentationDetents([.medium, .large])
@@ -269,23 +269,12 @@ struct DiscoverView: View {
 
     private var listContent: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 20) {
+            LazyVStack(alignment: .leading, spacing: 16) {
                 messages
-
                 discoveryControls
-
-                DiscoveryHero(
-                    stationCount: visibleStations.count,
-                    profileSummary: store.profileSummary,
-                    hasLocation: store.currentLocation != nil,
-                    isLoading: store.isLoadingStations,
-                    locate: { Task { await store.useCurrentLocation() } },
-                    editVehicle: { showingVehicleProfile = true }
-                )
-
-                HStack(alignment: .firstTextBaseline) {
-                    Text("Compatible chargers")
-                        .font(.title2.weight(.bold))
+                HStack {
+                    Text("\(visibleStations.count) compatible chargers")
+                        .font(.headline)
                     Spacer()
                     if store.isLoadingStations { ProgressView().controlSize(.small) }
                 }
@@ -304,6 +293,7 @@ struct DiscoverView: View {
                             )
                         }
                         .buttonStyle(.plain)
+                        Divider().padding(.leading, 58)
                     }
                 }
             }
@@ -317,7 +307,7 @@ struct DiscoverView: View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    mapMessages
+                    messages
                     discoveryControls
                     HStack {
                         Text("\(visibleStations.count) compatible chargers")
@@ -329,7 +319,7 @@ struct DiscoverView: View {
                 .padding(.horizontal, 20)
                 .padding(.vertical, 14)
             }
-            .frame(maxHeight: dynamicTypeSize.isAccessibilitySize ? 370 : 380)
+            .frame(maxHeight: dynamicTypeSize.isAccessibilitySize ? 380 : 290)
 
             if hasNoResults {
                 ScrollView {
@@ -372,25 +362,10 @@ struct DiscoverView: View {
     }
 
     @ViewBuilder private var messages: some View {
-        if store.isDemoMode && showsDemoBanner {
-            MessageBanner(
-                message: "Demo data is active. Connect Supabase and the Gentari feed for live status.",
-                isError: false,
-                dismiss: { showsDemoBanner = false }
-            )
-        }
-        if let error = store.errorMessage {
-            MessageBanner(message: error, isError: true, dismiss: store.clearMessages)
-        }
-    }
-
-    @ViewBuilder private var mapMessages: some View {
-        if store.isDemoMode && showsDemoBanner {
-            MessageBanner(
-                message: "Demo · not live",
-                isError: false,
-                dismiss: { showsDemoBanner = false }
-            )
+        if store.isDemoMode {
+            Label("Demo chargers · not live", systemImage: "info.circle")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
         }
         if let error = store.errorMessage {
             MessageBanner(message: error, isError: true, dismiss: store.clearMessages)
@@ -399,13 +374,6 @@ struct DiscoverView: View {
 
     private var discoveryControls: some View {
         VStack(spacing: 12) {
-            Picker("Charger view", selection: $displayMode) {
-                ForEach(DisplayMode.allCases) { mode in
-                    Text(mode.rawValue).tag(mode)
-                }
-            }
-            .pickerStyle(.segmented)
-
             HStack(spacing: 10) {
                 Image(systemName: "magnifyingglass")
                     .foregroundStyle(.secondary)
@@ -423,9 +391,23 @@ struct DiscoverView: View {
             .padding(12)
             .background(Color.voltSurface, in: .rect(cornerRadius: 14))
 
-            Toggle("Available now", isOn: $availableNowOnly)
-                .font(.subheadline.weight(.medium))
-                .accessibilityHint("Shows only chargers with a fresh available status and a positive connector count")
+            Picker("Charger view", selection: $displayMode) {
+                ForEach(DisplayMode.allCases) { mode in Text(mode.rawValue).tag(mode) }
+            }
+            .pickerStyle(.segmented)
+
+            HStack {
+                Toggle("Available now", isOn: $availableNowOnly)
+                    .font(.subheadline.weight(.medium))
+                    .accessibilityHint("Shows only chargers with a fresh available status and a positive connector count")
+                if displayMode == .list {
+                    Button("Use my location", systemImage: "location") {
+                        Task { await store.useCurrentLocation() }
+                    }
+                    .labelStyle(.iconOnly)
+                    .buttonStyle(.bordered)
+                }
+            }
         }
     }
 
@@ -540,72 +522,6 @@ private struct StationMapPreview: View {
     }
 }
 
-struct DiscoveryHero: View {
-    let stationCount: Int
-    let profileSummary: String
-    let hasLocation: Bool
-    let isLoading: Bool
-    let locate: () -> Void
-    let editVehicle: () -> Void
-    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            HStack(alignment: .top) {
-                VStack(alignment: .leading, spacing: 7) {
-                    Text("READY FOR THE ROAD")
-                        .font(.caption.weight(.bold))
-                        .tracking(1.2)
-                        .foregroundStyle(.white.opacity(0.72))
-                    Text("\(stationCount) matches")
-                        .font(.system(.largeTitle, design: .rounded).weight(.bold))
-                        .foregroundStyle(.white)
-                    Text(profileSummary.isEmpty ? "Vehicle setup required" : profileSummary)
-                        .font(.subheadline.weight(.medium))
-                        .foregroundStyle(.white.opacity(0.78))
-                }
-                Spacer()
-                Image(systemName: "bolt.fill")
-                    .font(.system(size: 28, weight: .bold))
-                    .foregroundStyle(Color.voltMint)
-                    .padding(14)
-                    .background(.white.opacity(0.12), in: Circle())
-                    .accessibilityHidden(true)
-            }
-
-            if dynamicTypeSize.isAccessibilitySize {
-                VStack(alignment: .leading, spacing: 12) { heroActions }
-            } else {
-                HStack(spacing: 12) { heroActions }
-            }
-
-            Label("VoltWay does not save your location or include it in charger requests.", systemImage: "lock.fill")
-                .font(.caption)
-                .foregroundStyle(.white.opacity(0.66))
-        }
-        .padding(22)
-        .background(
-            LinearGradient(colors: [Color.voltInk, Color.voltBlue.opacity(0.92)], startPoint: .topLeading, endPoint: .bottomTrailing)
-        )
-        .clipShape(.rect(cornerRadius: 26))
-        .accessibilityElement(children: .contain)
-    }
-
-    @ViewBuilder private var heroActions: some View {
-        Button(action: locate) {
-            Label(hasLocation ? "Location updated" : "Use my location", systemImage: hasLocation ? "location.fill" : "location")
-        }
-        .buttonStyle(VoltGlassButtonStyle())
-        .foregroundStyle(.white)
-        .disabled(isLoading)
-
-        Button("Edit EV", action: editVehicle)
-            .font(.subheadline.weight(.semibold))
-            .foregroundStyle(.white.opacity(0.86))
-            .frame(minHeight: 44)
-    }
-}
-
 struct StationRow: View {
     let station: ChargingStation
     let distance: Double?
@@ -613,55 +529,54 @@ struct StationRow: View {
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     var body: some View {
-        VoltSurface {
-            HStack(alignment: .top, spacing: 14) {
-                Image(systemName: "bolt.car.fill")
-                    .font(.title3.weight(.semibold))
-                    .foregroundStyle(Color.voltBlue)
-                    .frame(width: 44, height: 44)
-                    .background(Color.voltBlue.opacity(0.10), in: .rect(cornerRadius: 14))
-                    .accessibilityHidden(true)
+        HStack(alignment: .top, spacing: 14) {
+            Image(systemName: "bolt.car.fill")
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(Color.voltBlue)
+                .frame(width: 44, height: 44)
+                .background(Color.voltBlue.opacity(0.10), in: .rect(cornerRadius: 14))
+                .accessibilityHidden(true)
 
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack(alignment: .firstTextBaseline) {
-                        Text(station.name)
-                            .font(.headline)
-                            .foregroundStyle(.primary)
-                            .lineLimit(2)
-                        Spacer(minLength: 8)
-                        if isFavorite {
-                            Image(systemName: "heart.fill")
-                                .foregroundStyle(Color.voltBlue)
-                                .accessibilityLabel("Favorite")
-                        }
-                    }
-                    Text(station.address)
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(station.name)
+                        .font(.headline)
+                        .foregroundStyle(.primary)
                         .lineLimit(2)
-                    HStack(spacing: 8) {
-                        AvailabilityPill(availability: station.availability)
-                        if let distance {
-                            Text(distanceText(distance))
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(.secondary)
-                        }
+                    Spacer(minLength: 8)
+                    if isFavorite {
+                        Image(systemName: "heart.fill")
+                            .foregroundStyle(Color.voltBlue)
+                            .accessibilityLabel("Favorite")
                     }
-                    if dynamicTypeSize.isAccessibilitySize {
-                        VStack(alignment: .leading, spacing: 4) {
-                            connectorSummary
-                            priceLabel
-                        }
-                    } else {
-                        HStack {
-                            connectorSummary
-                            Spacer(minLength: 4)
-                            priceLabel
-                        }
+                }
+                Text(station.address)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                HStack(spacing: 8) {
+                    AvailabilityPill(availability: station.availability)
+                    if let distance {
+                        Text(distanceText(distance))
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                if dynamicTypeSize.isAccessibilitySize {
+                    VStack(alignment: .leading, spacing: 4) {
+                        connectorSummary
+                        priceLabel
+                    }
+                } else {
+                    HStack {
+                        connectorSummary
+                        Spacer(minLength: 4)
+                        priceLabel
                     }
                 }
             }
         }
+        .padding(.vertical, 12)
         .accessibilityElement(children: .combine)
     }
 
@@ -689,6 +604,7 @@ struct StationDetailView: View {
     let store: VoltWayStore
     @State private var selectedEnergyKWh = 20
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var isFavorite: Bool { store.favoriteStationIDs.contains(station.id) }
 
@@ -699,16 +615,21 @@ struct StationDetailView: View {
                 statusCard
                 costEstimateCard
                 connectorCard
-                Button {
-                    MapsHandoff.open(station)
-                } label: {
-                    Label("Navigate with Apple Maps", systemImage: "arrow.triangle.turn.up.right.diamond.fill")
-                }
-                .buttonStyle(VoltPrimaryButtonStyle())
             }
             .padding(20)
         }
         .background(Color.voltBackground)
+        .safeAreaInset(edge: .bottom) {
+            Button {
+                MapsHandoff.open(station)
+            } label: {
+                Label("Navigate with Apple Maps", systemImage: "arrow.triangle.turn.up.right.diamond.fill")
+            }
+            .buttonStyle(VoltPrimaryButtonStyle())
+            .padding(.horizontal, 20)
+            .padding(.vertical, 10)
+            .background(.bar)
+        }
         .navigationTitle("Charger")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -764,19 +685,18 @@ struct StationDetailView: View {
     }
 
     private var connectorCard: some View {
-        VoltSurface {
-            VStack(alignment: .leading, spacing: 14) {
-                Text("Connectors")
-                    .font(.headline)
-                ForEach(station.connectors, id: \.self) { connector in
-                    HStack {
-                        Label(connector.kind.title, systemImage: connector.kind.systemImage)
-                        Spacer()
-                        Text("\(connector.powerKW.formatted(.number.precision(.fractionLength(0)))) kW · \(connector.count)")
-                            .foregroundStyle(.secondary)
-                    }
-                    .font(.subheadline)
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Connectors")
+                .font(.headline)
+            ForEach(station.connectors, id: \.self) { connector in
+                HStack {
+                    Label(connector.kind.title, systemImage: connector.kind.systemImage)
+                    Spacer()
+                    Text("\(connector.powerKW.formatted(.number.precision(.fractionLength(0)))) kW · \(connector.count)")
+                        .foregroundStyle(.secondary)
                 }
+                .font(.subheadline)
+                Divider()
             }
         }
     }
@@ -806,7 +726,7 @@ struct StationDetailView: View {
                 }
             }
         }
-        .animation(.default, value: selectedEnergyKWh)
+        .animation(reduceMotion ? nil : .default, value: selectedEnergyKWh)
     }
 
     @ViewBuilder private var energyPicker: some View {
@@ -842,7 +762,7 @@ struct StationDetailView: View {
 
     private var priceLabel: some View {
         Text(station.price?.displayText() ?? "Price unavailable")
-            .font(.headline)
+            .font(.title3.weight(.bold))
             .multilineTextAlignment(dynamicTypeSize.isAccessibilitySize ? .leading : .trailing)
     }
 
@@ -908,32 +828,29 @@ struct TripPlannerView: View {
             .padding(20)
         }
         .background(Color.voltBackground)
-        .navigationTitle("Plan a trip")
+        .navigationTitle("Trip")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Button("Vehicle", systemImage: "car.side") { showingVehicleProfile = true }
-                    .accessibilityLabel("Edit vehicle profile")
-            }
-        }
         .sheet(isPresented: $showingVehicleProfile) {
             NavigationStack { VehicleProfileView(store: store) }
                 .presentationDetents([.medium, .large])
         }
         .sheet(item: selectedStationBinding) { station in
-            NavigationStack { StationDetailView(station: station, store: store) }
+            NavigationStack {
+                StationDetailView(station: station, store: store)
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Done") { selectedStationID = nil }
+                        }
+                    }
+            }
         }
     }
 
     private var intro: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("CHARGERS ALONG YOUR DRIVE")
-                .font(.caption.weight(.bold))
-                .tracking(1)
-                .foregroundStyle(Color.voltBlue)
-            Text("Plan a trip")
-                .font(.system(.largeTitle, design: .rounded).weight(.bold))
-            Text("Choose a destination, then use your current location to find compatible chargers near the recommended driving route.")
+            Text("Where are you going?")
+                .font(.system(.title, design: .rounded).weight(.bold))
+            Text("Choose a destination to see compatible chargers along the drive.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
             Label("VoltWay doesn’t save trip details. Apple MapKit processes your location and destination for routing.", systemImage: "lock.fill")
@@ -945,10 +862,13 @@ struct TripPlannerView: View {
     private var destinationSearch: some View {
         VoltSurface {
             VStack(alignment: .leading, spacing: 12) {
-                TextField("Search a destination", text: $destinationQuery)
+                Text("Destination")
+                    .font(.subheadline.weight(.semibold))
+                TextField("City, place or address", text: $destinationQuery)
                     .textContentType(.fullStreetAddress)
                     .textInputAutocapitalization(.words)
                     .submitLabel(.search)
+                    .textFieldStyle(.roundedBorder)
                     .onSubmit { Task { await searchDestinations() } }
                 Button {
                     Task { await searchDestinations() }
@@ -978,10 +898,10 @@ struct TripPlannerView: View {
                         Text(destination.address).font(.subheadline).foregroundStyle(.secondary)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(14)
-                    .background(Color.voltSurface, in: .rect(cornerRadius: 16))
+                    .padding(.vertical, 10)
                 }
                 .buttonStyle(.plain)
+                Divider()
             }
         }
     }
@@ -1021,8 +941,8 @@ struct TripPlannerView: View {
                         .font(.subheadline).foregroundStyle(.secondary)
                 }
                 routeMap
-                    .frame(height: 300)
-                    .clipShape(.rect(cornerRadius: 22))
+                    .frame(height: 340)
+                    .clipShape(.rect(cornerRadius: 18))
                 Text("Compatible chargers within 5 km of route")
                     .font(.title3.weight(.bold))
                 if routeStops.isEmpty {
@@ -1047,6 +967,7 @@ struct TripPlannerView: View {
                             }
                         }
                         .buttonStyle(.plain)
+                        Divider()
                     }
                 }
                 Text("Stations are listed in travel order. Off-route distance is measured to the route geometry, not a road detour.")
@@ -1064,7 +985,7 @@ struct TripPlannerView: View {
             }
             if let first = routeCoordinates.first {
                 Marker("Start", systemImage: "location.fill", coordinate: CLLocationCoordinate2D(latitude: first.latitude, longitude: first.longitude))
-                    .tint(.green)
+                    .tint(Color.voltBlue)
             }
             if let last = routeCoordinates.last {
                 Marker("Destination", systemImage: "mappin.and.ellipse", coordinate: CLLocationCoordinate2D(latitude: last.latitude, longitude: last.longitude))
@@ -1072,7 +993,7 @@ struct TripPlannerView: View {
             }
             ForEach(routeStops, id: \.station.id) { stop in
                 Marker(stop.station.name, systemImage: "bolt.car.fill", coordinate: CLLocationCoordinate2D(latitude: stop.station.coordinate.latitude, longitude: stop.station.coordinate.longitude))
-                    .tint(Color.voltMint)
+                    .tint(stop.station.availability.isReportedAvailable() ? Color.voltMint : Color.voltBlue)
                     .tag(stop.station.id)
             }
         }
@@ -1169,7 +1090,13 @@ struct FavoritesView: View {
 
     var body: some View {
         ScrollView {
-            LazyVStack(spacing: 14) {
+            LazyVStack(alignment: .leading, spacing: 0) {
+                if store.isDemoMode {
+                    Label("Demo chargers · not live", systemImage: "info.circle")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .padding(.bottom, 18)
+                }
                 if store.favoriteStations.isEmpty {
                     EmptyState(
                         icon: "heart",
@@ -1186,6 +1113,7 @@ struct FavoritesView: View {
                             StationRow(station: station, distance: station.distance(from: store.currentLocation), isFavorite: true)
                         }
                         .buttonStyle(.plain)
+                        Divider().padding(.leading, 58)
                     }
                 }
             }
@@ -1193,6 +1121,7 @@ struct FavoritesView: View {
         }
         .background(Color.voltBackground)
         .navigationTitle("Saved")
+        .navigationBarTitleDisplayMode(.inline)
     }
 }
 
@@ -1232,6 +1161,7 @@ struct AccountView: View {
             }
         }
         .navigationTitle("Account")
+        .navigationBarTitleDisplayMode(.inline)
         .sheet(isPresented: $showingVehicleProfile) {
             NavigationStack { VehicleProfileView(store: store) }
                 .presentationDetents([.medium, .large])

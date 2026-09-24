@@ -87,7 +87,13 @@ final class CarPlaySceneDelegate: NSObject, CPTemplateApplicationSceneDelegate {
 
         let section: CPListSection
         if items.isEmpty {
-            section = CPListSection(items: [CPListItem(text: "No chargers to show", detailText: "Open VoltWay on iPhone.")])
+            let emptyTitle: String
+            switch title {
+            case "Saved": emptyTitle = "No saved chargers"
+            case "Nearby": emptyTitle = "No nearby chargers"
+            default: emptyTitle = "No chargers to show"
+            }
+            section = CPListSection(items: [CPListItem(text: emptyTitle, detailText: "Open VoltWay on iPhone for details.")])
         } else {
             section = CPListSection(items: items)
         }
@@ -97,13 +103,13 @@ final class CarPlaySceneDelegate: NSObject, CPTemplateApplicationSceneDelegate {
     private func showDetails(for station: ChargingStation) {
         let information = [
             CPInformationItem(title: "Status", detail: station.availability.displayText()),
-            CPInformationItem(title: "Status updated", detail: updateText(station.availability.lastUpdated)),
             CPInformationItem(title: "Price", detail: station.price?.displayText() ?? "Price unavailable"),
-            CPInformationItem(title: "Price updated", detail: updateText(station.price?.lastUpdated)),
             CPInformationItem(title: "Connectors", detail: station.connectorSummary),
+            CPInformationItem(title: "Status updated", detail: updateText(station.availability.lastUpdated)),
+            CPInformationItem(title: "Price updated", detail: updateText(station.price?.lastUpdated)),
             CPInformationItem(title: "Address", detail: station.address)
         ]
-        let navigate = CPTextButton(title: "Navigate", textStyle: .confirm) { _ in
+        let navigate = CPTextButton(title: "Navigate in Maps", textStyle: .confirm) { _ in
             MapsHandoff.open(station)
         }
         let template = CPInformationTemplate(title: station.name, layout: .leading, items: information, actions: [navigate])
