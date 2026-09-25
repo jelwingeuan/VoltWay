@@ -208,7 +208,7 @@ struct DiscoverView: View {
     @State private var searchText = ""
     @State private var availableNowOnly = false
     @State private var selectedStationID: String?
-    @State private var mapPosition: MapCameraPosition = .automatic
+    @State private var mapRecenterRequest: MapRecenterRequest?
     @State private var freshnessTime = Date.now
     @FocusState private var searchIsFocused: Bool
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
@@ -321,18 +321,12 @@ struct DiscoverView: View {
                         .padding(.top, 12)
                 }
             } else {
-                Map(position: $mapPosition, selection: $selectedStationID) {
-                    ForEach(visibleStations) { station in
-                        Marker(
-                            station.name,
-                            systemImage: "bolt.car.fill",
-                            coordinate: station.coordinate.coreLocation.coordinate
-                        )
-                        .tint(station.availability.isReportedAvailable(at: freshnessTime) ? Color.voltMint : Color.voltBlue)
-                        .tag(station.id)
-                    }
-                }
-                .mapControls { MapCompass() }
+                ChargerMapView(
+                    stations: visibleStations,
+                    freshnessTime: freshnessTime,
+                    recenterRequest: mapRecenterRequest,
+                    selectedStationID: $selectedStationID
+                )
                 .safeAreaInset(edge: .top, spacing: 0) { mapChrome }
                 .safeAreaInset(edge: .bottom) {
                     if !dynamicTypeSize.isAccessibilitySize, let selectedStation {
@@ -346,13 +340,21 @@ struct DiscoverView: View {
     }
 
     private var mapChrome: some View {
-        ScrollView {
-            discoveryChrome
-                .padding(.horizontal, 14)
-                .padding(.top, 8)
+        Group {
+            if dynamicTypeSize.isAccessibilitySize {
+                ScrollView {
+                    discoveryChrome
+                        .padding(.horizontal, 14)
+                        .padding(.top, 8)
+                }
+                .scrollIndicators(.hidden)
+                .frame(maxHeight: 340)
+            } else {
+                discoveryChrome
+                    .padding(.horizontal, 14)
+                    .padding(.top, 8)
+            }
         }
-        .scrollIndicators(.hidden)
-        .frame(maxHeight: dynamicTypeSize.isAccessibilitySize ? 340 : 180)
     }
 
     private var discoveryChrome: some View {
@@ -525,10 +527,42 @@ struct DiscoverView: View {
 
     private func locateOnMap() async {
         guard let location = await store.useCurrentLocation() else { return }
-        mapPosition = .region(MKCoordinateRegion(
-            center: location.coreLocation.coordinate,
-            span: MKCoordinateSpan(latitudeDelta: 0.12, longitudeDelta: 0.12)
-        ))
+        mapRecenterRequest = MapRecenterRequest(id: UUID(), location: location)
+    }
+}
+
+private struct MapRecenterRequest: Equatable {
+    let id: UUID
+    let location: Coordinate
+}
+
+private struct ChargerMapView: View {
+    let stations: [ChargingStation]
+    let freshnessTime: Date
+    let recenterRequest: MapRecenterRequest?
+    @Binding var selectedStationID: String?
+    @State private var position: MapCameraPosition = .automatic
+
+    var body: some View {
+        Map(position: $position, selection: $selectedStationID) {
+            ForEach(stations) { station in
+                Marker(
+                    station.name,
+                    systemImage: "bolt.car.fill",
+                    coordinate: station.coordinate.coreLocation.coordinate
+                )
+                .tint(station.availability.isReportedAvailable(at: freshnessTime) ? Color.voltMint : Color.voltBlue)
+                .tag(station.id)
+            }
+        }
+        .mapControls { MapCompass() }
+        .onChange(of: recenterRequest) { _, request in
+            guard let request else { return }
+            position = .region(MKCoordinateRegion(
+                center: request.location.coreLocation.coordinate,
+                span: MKCoordinateSpan(latitudeDelta: 0.12, longitudeDelta: 0.12)
+            ))
+        }
     }
 }
 
@@ -920,7 +954,6 @@ struct TripPlannerView: View {
     @State private var routeMessage: String?
     @State private var searchMessage: String?
     @State private var selectedStationID: String?
-    @State private var cameraPosition: MapCameraPosition = .automatic
     @State private var showingVehicleProfile = false
     @Namespace private var stationTransition
 
@@ -1110,7 +1143,7 @@ struct TripPlannerView: View {
     }
 
     private var routeMap: some View {
-        Map(position: $cameraPosition, selection: $selectedStationID) {
+        Map(initialPosition: .region(routeRegion(for: routeCoordinates)), selection: $selectedStationID) {
             if routeCoordinates.count > 1 {
                 MapPolyline(coordinates: routeCoordinates.map { CLLocationCoordinate2D(latitude: $0.latitude, longitude: $0.longitude) })
                     .stroke(Color.voltBlue, lineWidth: 5)
@@ -1195,7 +1228,6 @@ struct TripPlannerView: View {
             routeStops = RouteStopMatcher.stops(along: routeCoordinates, compatibleStations: store.compatibleStations)
             routeDistanceMeters = route.distance
             routeTravelTime = route.expectedTravelTime
-            cameraPosition = .region(routeRegion(for: routeCoordinates))
         } catch {
             routeMessage = "No route could be calculated. Check your connection or choose another destination."
         }
