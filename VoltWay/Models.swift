@@ -301,6 +301,28 @@ enum StationDiscovery {
             return matchesSearch && matchesAvailability
         }
     }
+
+    static func nearbyAlternatives(
+        to station: ChargingStation,
+        compatibleStations: [ChargingStation],
+        radiusMeters: Double = 10_000,
+        limit: Int = 3,
+        now: Date = .now
+    ) -> [ChargingStation] {
+        guard radiusMeters >= 0, limit > 0 else { return [] }
+        return Array(compatibleStations
+            .filter { $0.id != station.id && ($0.distance(from: station.coordinate) ?? .infinity) <= radiusMeters }
+            .sorted { lhs, rhs in
+                let lhsAvailable = lhs.availability.isReportedAvailable(at: now)
+                let rhsAvailable = rhs.availability.isReportedAvailable(at: now)
+                if lhsAvailable != rhsAvailable { return lhsAvailable }
+                let lhsDistance = lhs.distance(from: station.coordinate) ?? .infinity
+                let rhsDistance = rhs.distance(from: station.coordinate) ?? .infinity
+                if lhsDistance != rhsDistance { return lhsDistance < rhsDistance }
+                return lhs.id < rhs.id
+            }
+            .prefix(limit))
+    }
 }
 
 struct UserSession: Codable, Equatable, Sendable {

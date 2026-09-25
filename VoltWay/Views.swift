@@ -272,12 +272,7 @@ struct DiscoverView: View {
             LazyVStack(alignment: .leading, spacing: 16) {
                 messages
                 discoveryControls
-                HStack {
-                    Text("\(visibleStations.count) compatible chargers")
-                        .font(.headline)
-                    Spacer()
-                    if store.isLoadingStations { ProgressView().controlSize(.small) }
-                }
+                resultsHeader
 
                 if hasNoResults {
                     emptyResults
@@ -309,12 +304,7 @@ struct DiscoverView: View {
                 VStack(alignment: .leading, spacing: 16) {
                     messages
                     discoveryControls
-                    HStack {
-                        Text("\(visibleStations.count) compatible chargers")
-                            .font(.subheadline.weight(.semibold))
-                        Spacer()
-                        if store.isLoadingStations { ProgressView().controlSize(.small) }
-                    }
+                    resultsHeader
                 }
                 .padding(.horizontal, 20)
                 .padding(.vertical, 14)
@@ -366,9 +356,30 @@ struct DiscoverView: View {
             Label("Demo chargers · not live", systemImage: "info.circle")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
+        } else if let lastSuccessfulStationFetchAt = store.lastSuccessfulStationFetchAt {
+            Label("Station list last fetched \(lastSuccessfulStationFetchAt.formatted(.relative(presentation: .named)))", systemImage: "clock")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
         if let error = store.errorMessage {
             MessageBanner(message: error, isError: true, dismiss: store.clearMessages)
+        }
+    }
+
+    private var resultsHeader: some View {
+        HStack {
+            Text("\(visibleStations.count) compatible chargers")
+                .font(.subheadline.weight(.semibold))
+            Spacer()
+            if store.isLoadingStations {
+                ProgressView().controlSize(.small)
+            } else if !store.isDemoMode {
+                Button("Refresh chargers", systemImage: "arrow.clockwise") {
+                    Task { await store.refreshStations() }
+                }
+                .labelStyle(.iconOnly)
+                .buttonStyle(.bordered)
+            }
         }
     }
 
@@ -603,6 +614,7 @@ struct StationDetailView: View {
     let station: ChargingStation
     let store: VoltWayStore
     @State private var selectedEnergyKWh = 20
+    @State private var freshnessTime = Date.now
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -613,6 +625,7 @@ struct StationDetailView: View {
             VStack(alignment: .leading, spacing: 20) {
                 detailHeader
                 statusCard
+                alternativeChargers
                 costEstimateCard
                 connectorCard
             }
@@ -641,6 +654,9 @@ struct StationDetailView: View {
                 }
                 .accessibilityLabel(isFavorite ? "Remove from favorites" : "Add to favorites")
             }
+        }
+        .onReceive(Timer.publish(every: 15, on: .main, in: .common).autoconnect()) { time in
+            freshnessTime = time
         }
     }
 
@@ -680,6 +696,38 @@ struct StationDetailView: View {
                 }
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var alternativeChargers: some View {
+        let alternatives = StationDiscovery.nearbyAlternatives(
+            to: station, compatibleStations: store.compatibleStations, now: freshnessTime
+        )
+        return VStack(alignment: .leading, spacing: 10) {
+            Text("Other compatible chargers")
+                .font(.title3.weight(.bold))
+            Text("Within 10 km of this charger · straight-line distance")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if alternatives.isEmpty {
+                Text("No other compatible chargers within 10 km.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(alternatives) { alternative in
+                    NavigationLink {
+                        StationDetailView(station: alternative, store: store)
+                    } label: {
+                        StationRow(
+                            station: alternative,
+                            distance: alternative.distance(from: station.coordinate),
+                            isFavorite: store.favoriteStationIDs.contains(alternative.id)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    Divider()
+                }
             }
         }
     }

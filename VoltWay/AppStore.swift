@@ -9,6 +9,7 @@ final class VoltWayStore {
     private(set) var stations: [ChargingStation]
     private(set) var favorites: [FavoriteStation] = []
     private(set) var currentLocation: Coordinate?
+    private(set) var lastSuccessfulStationFetchAt: Date?
     private(set) var isBootstrapping = true
     private(set) var isLoadingStations = false
     private(set) var isAuthenticating = false
@@ -127,6 +128,7 @@ final class VoltWayStore {
             stations = []
             favorites = []
             currentLocation = nil
+            lastSuccessfulStationFetchAt = nil
             CarPlaySnapshotStore.clear()
         } catch {
             show(error)
@@ -138,6 +140,8 @@ final class VoltWayStore {
         defer { isLoadingStations = false }
         do {
             stations = try await backend.stations(profile: profile, session: session)
+            if !isDemoMode { lastSuccessfulStationFetchAt = .now }
+            errorMessage = nil
             persistCarPlaySnapshot()
         } catch {
             show(error)
@@ -167,12 +171,14 @@ final class VoltWayStore {
         }
 
         let previous = profile
+        let previousFetchAt = lastSuccessfulStationFetchAt
         profile = VehicleProfile(
             userID: session?.userID,
             connectors: connectors.sorted { $0.rawValue < $1.rawValue },
             minimumPowerKW: minimumPowerKW,
             updatedAt: .now
         )
+        lastSuccessfulStationFetchAt = nil
 
         do {
             if let session { try await backend.saveProfile(profile, session: session) }
@@ -181,6 +187,7 @@ final class VoltWayStore {
             return true
         } catch {
             profile = previous
+            lastSuccessfulStationFetchAt = previousFetchAt
             persistCarPlaySnapshot()
             show(error)
             return false

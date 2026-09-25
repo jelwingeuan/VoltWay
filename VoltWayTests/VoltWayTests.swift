@@ -96,6 +96,49 @@ struct VoltWayTests {
         #expect(results.map(\.id) == ["second", "first"])
     }
 
+    @Test("Nearby alternatives prefer confirmed availability, then distance, and show at most three")
+    func nearbyAlternativeRanking() {
+        let origin = station(id: "origin", connector: .ccs2, power: 100, state: .occupied)
+        let nearOccupied = station(id: "occupied", connector: .ccs2, power: 100, state: .occupied,
+                                   coordinate: Coordinate(latitude: 3.141, longitude: 101.6869))
+        let nearAvailable = station(id: "near", connector: .ccs2, power: 100, state: .available,
+                                    coordinate: Coordinate(latitude: 3.149, longitude: 101.6869))
+        let fartherAvailable = station(id: "farther", connector: .ccs2, power: 100, state: .available,
+                                       coordinate: Coordinate(latitude: 3.16, longitude: 101.6869))
+        let stale = station(id: "stale", connector: .ccs2, power: 100, state: .available,
+                            updatedAt: now.addingTimeInterval(-301),
+                            coordinate: Coordinate(latitude: 3.14, longitude: 101.6869))
+
+        let results = StationDiscovery.nearbyAlternatives(
+            to: origin,
+            compatibleStations: [stale, nearOccupied, fartherAvailable, origin, nearAvailable],
+            now: now
+        )
+        #expect(results.map(\.id) == ["near", "farther", "stale"])
+    }
+
+    @Test("Nearby alternatives include the distance boundary but exclude incompatible and distant stations")
+    func nearbyAlternativeBoundary() throws {
+        let origin = station(id: "origin", connector: .ccs2, power: 100, state: .available)
+        let boundary = station(id: "boundary", connector: .ccs2, power: 100, state: .available,
+                               coordinate: Coordinate(latitude: 3.18, longitude: 101.6869))
+        let outside = station(id: "outside", connector: .ccs2, power: 100, state: .available,
+                              coordinate: Coordinate(latitude: 3.20, longitude: 101.6869))
+        let incompatible = station(id: "type2", connector: .type2, power: 100, state: .available,
+                                   coordinate: Coordinate(latitude: 3.14, longitude: 101.6869))
+        let profile = VehicleProfile(connectors: [.ccs2], minimumPowerKW: 50)
+        let compatible = StationDiscovery.compatibleStations(
+            from: [outside, incompatible, boundary, origin], profile: profile, near: nil, now: now
+        )
+        let radius = try #require(boundary.distance(from: origin.coordinate))
+
+        let results = StationDiscovery.nearbyAlternatives(
+            to: origin, compatibleStations: compatible, radiusMeters: radius, now: now
+        )
+        #expect(results.map(\.id) == ["boundary"])
+        #expect(StationDiscovery.nearbyAlternatives(to: origin, compatibleStations: [origin], now: now).isEmpty)
+    }
+
     @Test("Missing and old price timestamps never imply a current price")
     func stalePrice() {
         let missing = Price(amountMYR: 1.50, unit: .kWh, lastUpdated: nil)
@@ -215,6 +258,78 @@ struct VoltWayTests {
 struct BackendClientTests {
     private let configuration = AppConfiguration(supabaseURL: URL(string: "https://voltway.test"), supabaseAnonKey: "public-anon-key")
 
+    @Test("Only a successful live fetch updates the list-check time, and sign-out clears it")
+    @MainActor func successfulFetchTime() async throws {
+        let stationRequests = LockedCounter()
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let stationList = try encoder.encode([DemoData.stations[0]])
+        let response = Data(#"{"stations": "#.utf8) + stationList + Data("}".utf8)
+        MockURLProtocol.handler = { request in
+            let path = request.url?.path ?? ""
+            if path == "/auth/v1/token" {
+                return (200, Data(#"{"access_token":"fresh","refresh_token":"refresh-1","user":{"id":"user-1","email":"driver@example.com"}}"#.utf8))
+            }
+            if path == "/functions/v1/stations" {
+                stationRequests.increment()
+                return stationRequests.value == 2
+                    ? (503, Data(#"{"message":"Refresh failed"}"#.utf8))
+                    : (200, response)
+            }
+            return (200, Data("[]".utf8))
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let client = makeClient(account: "test-\(UUID().uuidString)")
+        let store = VoltWayStore(configuration: configuration, backend: client)
+        await store.signIn(email: "driver@example.com", password: "password-123")
+        let firstCheck = try #require(store.lastSuccessfulStationFetchAt)
+        #expect(store.stations.map(\.id) == ["gentari-petronas-solaris"])
+
+        await store.refreshStations()
+        #expect(store.lastSuccessfulStationFetchAt == firstCheck)
+        #expect(store.stations.map(\.id) == ["gentari-petronas-solaris"])
+        #expect(store.errorMessage == "Refresh failed")
+
+        await store.refreshStations()
+        #expect(try #require(store.lastSuccessfulStationFetchAt) > firstCheck)
+        #expect(store.errorMessage == nil)
+
+        await store.signOut()
+        #expect(store.lastSuccessfulStationFetchAt == nil)
+    }
+
+    @Test("Changing the vehicle invalidates a prior list-check time when its refresh fails")
+    @MainActor func profileChangeInvalidatesFetchTime() async throws {
+        let stationRequests = LockedCounter()
+        MockURLProtocol.handler = { request in
+            let path = request.url?.path ?? ""
+            if path == "/auth/v1/token" {
+                return (200, Data(#"{"access_token":"fresh","refresh_token":"refresh-1","user":{"id":"user-1","email":"driver@example.com"}}"#.utf8))
+            }
+            if path == "/functions/v1/stations" {
+                stationRequests.increment()
+                return stationRequests.value == 1
+                    ? (200, Data(#"{"stations":[]}"#.utf8))
+                    : (503, Data(#"{"message":"Refresh failed"}"#.utf8))
+            }
+            if path == "/rest/v1/vehicle_profiles", request.httpMethod == "POST" { return (204, Data()) }
+            return (200, Data("[]".utf8))
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let client = makeClient(account: "test-\(UUID().uuidString)")
+        let store = VoltWayStore(configuration: configuration, backend: client)
+        await store.signIn(email: "driver@example.com", password: "password-123")
+        #expect(store.lastSuccessfulStationFetchAt != nil)
+
+        let saved = await store.saveProfile(connectors: [.ccs2], minimumPowerKW: 100)
+        #expect(saved)
+        #expect(store.lastSuccessfulStationFetchAt == nil)
+        #expect(store.errorMessage == "Refresh failed")
+        await store.signOut()
+    }
+
     @Test("Concurrent expired-token requests share one refresh and persist rotated tokens")
     func concurrentRefresh() async throws {
         let refreshes = LockedCounter()
@@ -294,9 +409,11 @@ struct BackendClientTests {
         let store = VoltWayStore(configuration: configuration, backend: client)
         await store.signIn(email: "driver@example.com", password: "password-123")
         let previous = store.profile
+        let previousFetchAt = try #require(store.lastSuccessfulStationFetchAt)
         let saved = await store.saveProfile(connectors: [.ccs2], minimumPowerKW: 100)
         #expect(!saved)
         #expect(store.profile == previous)
+        #expect(store.lastSuccessfulStationFetchAt == previousFetchAt)
         #expect(store.errorMessage == "Save failed")
         CarPlaySnapshotStore.save(stations: [DemoData.stations[0]], favoriteStationIDs: [])
         await store.signOut()
