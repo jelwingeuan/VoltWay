@@ -50,6 +50,7 @@ struct AuthenticationView: View {
                     }
                     .frame(maxWidth: .infinity)
                     .font(.subheadline.weight(.semibold))
+                    .buttonStyle(.glass)
                 }
             }
             .padding(.horizontal, 24)
@@ -120,13 +121,15 @@ struct AuthenticationView: View {
         Button(action: submit) {
             Group {
                 if store.isAuthenticating {
-                    ProgressView().tint(.white)
+                    ProgressView()
                 } else {
                     Text(mode.rawValue)
                 }
             }
+            .frame(maxWidth: .infinity, minHeight: 50)
         }
-        .buttonStyle(VoltPrimaryButtonStyle())
+        .buttonStyle(.glassProminent)
+        .tint(.voltBlue)
         .disabled(store.isAuthenticating)
     }
 
@@ -144,26 +147,30 @@ struct AuthenticationView: View {
 struct MainTabView: View {
     let store: VoltWayStore
     @State private var showingAccount = false
+    @Namespace private var accountTransition
 
     var body: some View {
         TabView {
-            NavigationStack {
-                DiscoverView(store: store)
-                    .toolbar { accountButton }
+            Tab("Explore", systemImage: "map") {
+                NavigationStack {
+                    DiscoverView(store: store)
+                        .toolbar { accountButton }
+                }
             }
-            .tabItem { Label("Explore", systemImage: "map") }
 
-            NavigationStack {
-                TripPlannerView(store: store)
-                    .toolbar { accountButton }
+            Tab("Trip", systemImage: "point.topleft.down.to.point.bottomright.curvepath") {
+                NavigationStack {
+                    TripPlannerView(store: store)
+                        .toolbar { accountButton }
+                }
             }
-            .tabItem { Label("Trip", systemImage: "point.topleft.down.to.point.bottomright.curvepath") }
 
-            NavigationStack {
-                FavoritesView(store: store)
-                    .toolbar { accountButton }
+            Tab("Saved", systemImage: "heart") {
+                NavigationStack {
+                    FavoritesView(store: store)
+                        .toolbar { accountButton }
+                }
             }
-            .tabItem { Label("Saved", systemImage: "heart") }
         }
         .sheet(isPresented: $showingAccount) {
             NavigationStack {
@@ -174,6 +181,7 @@ struct MainTabView: View {
                         }
                     }
             }
+            .navigationTransition(.zoom(sourceID: "account", in: accountTransition))
         }
     }
 
@@ -181,6 +189,7 @@ struct MainTabView: View {
         ToolbarItem(placement: .topBarTrailing) {
             Button("Account", systemImage: "person.crop.circle") { showingAccount = true }
                 .accessibilityLabel("Account and vehicle")
+                .matchedTransitionSource(id: "account", in: accountTransition)
         }
     }
 }
@@ -201,7 +210,9 @@ struct DiscoverView: View {
     @State private var selectedStationID: String?
     @State private var mapPosition: MapCameraPosition = .automatic
     @State private var freshnessTime = Date.now
+    @FocusState private var searchIsFocused: Bool
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Namespace private var stationTransition
 
     private var visibleStations: [ChargingStation] {
         StationDiscovery.visibleStations(
@@ -270,9 +281,7 @@ struct DiscoverView: View {
     private var listContent: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 16) {
-                messages
-                discoveryControls
-                resultsHeader
+                discoveryChrome
 
                 if hasNoResults {
                     emptyResults
@@ -280,12 +289,14 @@ struct DiscoverView: View {
                     ForEach(visibleStations) { station in
                         NavigationLink {
                             StationDetailView(station: station, store: store)
+                                .navigationTransition(.zoom(sourceID: station.id, in: stationTransition))
                         } label: {
                             StationRow(
                                 station: station,
                                 distance: station.distance(from: store.currentLocation),
                                 isFavorite: store.favoriteStationIDs.contains(station.id)
                             )
+                            .matchedTransitionSource(id: station.id, in: stationTransition)
                         }
                         .buttonStyle(.plain)
                         Divider().padding(.leading, 58)
@@ -299,23 +310,15 @@ struct DiscoverView: View {
     }
 
     private var mapContent: some View {
-        VStack(spacing: 0) {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    messages
-                    discoveryControls
-                    resultsHeader
-                }
-                .padding(.horizontal, 20)
-                .padding(.vertical, 14)
-            }
-            .frame(maxHeight: dynamicTypeSize.isAccessibilitySize ? 380 : 290)
-
+        Group {
             if hasNoResults {
                 ScrollView {
+                    discoveryChrome
+                        .padding(.horizontal, 14)
+                        .padding(.top, 8)
                     emptyResults
                         .padding(.horizontal, 20)
-                        .padding(.top, 18)
+                        .padding(.top, 12)
                 }
             } else {
                 Map(position: $mapPosition, selection: $selectedStationID) {
@@ -330,16 +333,7 @@ struct DiscoverView: View {
                     }
                 }
                 .mapControls { MapCompass() }
-                .overlay(alignment: .topTrailing) {
-                    Button {
-                        Task { await locateOnMap() }
-                    } label: {
-                        Label("Use my location", systemImage: "location.fill")
-                    }
-                    .labelStyle(.iconOnly)
-                    .buttonStyle(.borderedProminent)
-                    .padding(14)
-                }
+                .safeAreaInset(edge: .top, spacing: 0) { mapChrome }
                 .safeAreaInset(edge: .bottom) {
                     if !dynamicTypeSize.isAccessibilitySize, let selectedStation {
                         StationMapPreview(station: selectedStation, store: store)
@@ -348,6 +342,28 @@ struct DiscoverView: View {
                     }
                 }
             }
+        }
+    }
+
+    private var mapChrome: some View {
+        ScrollView {
+            discoveryChrome
+                .padding(.horizontal, 14)
+                .padding(.top, 8)
+        }
+        .scrollIndicators(.hidden)
+        .frame(maxHeight: dynamicTypeSize.isAccessibilitySize ? 340 : 180)
+    }
+
+    private var discoveryChrome: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            discoveryControls
+            VStack(alignment: .leading, spacing: 8) {
+                messages
+                resultsHeader
+            }
+            .padding(10)
+            .background(Color.voltSurface, in: .rect(cornerRadius: 16))
         }
     }
 
@@ -369,56 +385,97 @@ struct DiscoverView: View {
     private var resultsHeader: some View {
         HStack {
             Text("\(visibleStations.count) compatible chargers")
-                .font(.subheadline.weight(.semibold))
+                .font(.caption.weight(.semibold))
             Spacer()
             if store.isLoadingStations {
                 ProgressView().controlSize(.small)
-            } else if !store.isDemoMode {
-                Button("Refresh chargers", systemImage: "arrow.clockwise") {
-                    Task { await store.refreshStations() }
-                }
-                .labelStyle(.iconOnly)
-                .buttonStyle(.bordered)
             }
         }
     }
 
     private var discoveryControls: some View {
-        VStack(spacing: 12) {
-            HStack(spacing: 10) {
-                Image(systemName: "magnifyingglass")
-                    .foregroundStyle(.secondary)
-                    .accessibilityHidden(true)
-                TextField("Search name or address", text: $searchText)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .submitLabel(.search)
-                if !searchText.isEmpty {
-                    Button("Clear search", systemImage: "xmark.circle.fill") { searchText = "" }
-                        .labelStyle(.iconOnly)
+        GlassEffectContainer(spacing: 8) {
+            VStack(spacing: 8) {
+                HStack(spacing: 10) {
+                    Image(systemName: "magnifyingglass")
                         .foregroundStyle(.secondary)
-                }
-            }
-            .padding(12)
-            .background(Color.voltSurface, in: .rect(cornerRadius: 14))
-
-            Picker("Charger view", selection: $displayMode) {
-                ForEach(DisplayMode.allCases) { mode in Text(mode.rawValue).tag(mode) }
-            }
-            .pickerStyle(.segmented)
-
-            HStack {
-                Toggle("Available now", isOn: $availableNowOnly)
-                    .font(.subheadline.weight(.medium))
-                    .accessibilityHint("Shows only chargers with a fresh available status and a positive connector count")
-                if displayMode == .list {
-                    Button("Use my location", systemImage: "location") {
-                        Task { await store.useCurrentLocation() }
+                        .accessibilityHidden(true)
+                    ZStack(alignment: .leading) {
+                        TextField("", text: $searchText)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .submitLabel(.search)
+                            .focused($searchIsFocused)
+                            .accessibilityLabel("Search name or address")
+                        if searchText.isEmpty && !searchIsFocused {
+                            Text("Search name or address")
+                                .foregroundStyle(Color.primary.opacity(0.8))
+                                .allowsHitTesting(false)
+                                .accessibilityHidden(true)
+                        }
                     }
-                    .labelStyle(.iconOnly)
-                    .buttonStyle(.bordered)
+                    if !searchText.isEmpty {
+                        Button("Clear search", systemImage: "xmark.circle.fill") { searchText = "" }
+                            .labelStyle(.iconOnly)
+                            .buttonStyle(.plain)
+                    }
                 }
+                .padding(.horizontal, 14)
+                .frame(minHeight: 48)
+                .glassEffect(.regular.tint(Color.voltSurface.opacity(0.65)).interactive(), in: .rect(cornerRadius: 16))
+
+                ScrollView(.horizontal) {
+                    HStack(spacing: 8) {
+                        ForEach(DisplayMode.allCases) { mode in
+                            displayButton(for: mode)
+                        }
+
+                        Button {
+                            availableNowOnly.toggle()
+                        } label: {
+                            Label("Available", systemImage: availableNowOnly ? "checkmark.circle.fill" : "checkmark.circle")
+                        }
+                        .buttonStyle(.glass)
+                        .tint(.primary)
+                        .accessibilityLabel("Available now")
+                        .accessibilityValue(availableNowOnly ? "On" : "Off")
+                        .accessibilityHint("Shows only chargers with a fresh available status and a positive connector count")
+
+                        if !store.isDemoMode {
+                            Button("Refresh chargers", systemImage: "arrow.clockwise") {
+                                Task { await store.refreshStations() }
+                            }
+                            .labelStyle(.iconOnly)
+                            .buttonStyle(.glass)
+                            .tint(.primary)
+                            .disabled(store.isLoadingStations)
+                        }
+                        Button("Use my location", systemImage: "location") {
+                            Task {
+                                if displayMode == .map { await locateOnMap() }
+                                else { await store.useCurrentLocation() }
+                            }
+                        }
+                        .labelStyle(.iconOnly)
+                        .buttonStyle(.glass)
+                        .tint(.primary)
+                    }
+                }
+                .scrollIndicators(.hidden)
             }
+        }
+    }
+
+    @ViewBuilder private func displayButton(for mode: DisplayMode) -> some View {
+        if displayMode == mode {
+            Button(mode.rawValue) { displayMode = mode }
+                .buttonStyle(.glassProminent)
+                .tint(.voltBlue)
+                .accessibilityAddTraits(.isSelected)
+        } else {
+            Button(mode.rawValue) { displayMode = mode }
+                .buttonStyle(.glass)
+                .tint(.primary)
         }
     }
 
@@ -479,6 +536,7 @@ private struct StationMapPreview: View {
     let station: ChargingStation
     let store: VoltWayStore
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Namespace private var detailTransition
 
     var body: some View {
         VoltSurface {
@@ -509,6 +567,12 @@ private struct StationMapPreview: View {
                         navigateButton
                     }
                 }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(updateText("Status", at: station.availability.lastUpdated))
+                    Text(updateText("Price", at: station.price?.lastUpdated))
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
         }
     }
@@ -521,8 +585,11 @@ private struct StationMapPreview: View {
     private var detailsLink: some View {
         NavigationLink("Details") {
             StationDetailView(station: station, store: store)
+                .navigationTransition(.zoom(sourceID: station.id, in: detailTransition))
         }
         .font(.subheadline.weight(.semibold))
+        .buttonStyle(.glass)
+        .matchedTransitionSource(id: station.id, in: detailTransition)
     }
 
     private var navigateButton: some View {
@@ -530,6 +597,13 @@ private struct StationMapPreview: View {
             MapsHandoff.open(station)
         }
         .font(.subheadline.weight(.semibold))
+        .buttonStyle(.glassProminent)
+        .tint(.voltBlue)
+    }
+
+    private func updateText(_ field: String, at date: Date?) -> String {
+        guard let date else { return "\(field) update time unavailable" }
+        return "\(field) updated \(date.formatted(.relative(presentation: .named)))"
     }
 }
 
@@ -617,6 +691,7 @@ struct StationDetailView: View {
     @State private var freshnessTime = Date.now
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Namespace private var alternativeTransition
 
     private var isFavorite: Bool { store.favoriteStationIDs.contains(station.id) }
 
@@ -637,11 +712,12 @@ struct StationDetailView: View {
                 MapsHandoff.open(station)
             } label: {
                 Label("Navigate with Apple Maps", systemImage: "arrow.triangle.turn.up.right.diamond.fill")
+                    .frame(maxWidth: .infinity, minHeight: 50)
             }
-            .buttonStyle(VoltPrimaryButtonStyle())
+            .buttonStyle(.glassProminent)
+            .tint(.voltBlue)
             .padding(.horizontal, 20)
             .padding(.vertical, 10)
-            .background(.bar)
         }
         .navigationTitle("Charger")
         .navigationBarTitleDisplayMode(.inline)
@@ -718,12 +794,14 @@ struct StationDetailView: View {
                 ForEach(alternatives) { alternative in
                     NavigationLink {
                         StationDetailView(station: alternative, store: store)
+                            .navigationTransition(.zoom(sourceID: alternative.id, in: alternativeTransition))
                     } label: {
                         StationRow(
                             station: alternative,
                             distance: alternative.distance(from: station.coordinate),
                             isFavorite: store.favoriteStationIDs.contains(alternative.id)
                         )
+                        .matchedTransitionSource(id: alternative.id, in: alternativeTransition)
                     }
                     .buttonStyle(.plain)
                     Divider()
@@ -788,7 +866,7 @@ struct StationDetailView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .contentShape(Rectangle())
             }
-            .buttonStyle(.bordered)
+            .buttonStyle(.glass)
             .accessibilityLabel("Energy amount, \(selectedEnergyKWh) kilowatt-hours")
         } else {
             Picker("Energy amount", selection: $selectedEnergyKWh) {
@@ -844,6 +922,7 @@ struct TripPlannerView: View {
     @State private var selectedStationID: String?
     @State private var cameraPosition: MapCameraPosition = .automatic
     @State private var showingVehicleProfile = false
+    @Namespace private var stationTransition
 
     private var selectedStation: ChargingStation? {
         routeStops.first { $0.station.id == selectedStationID }?.station
@@ -924,7 +1003,8 @@ struct TripPlannerView: View {
                     if isSearching { ProgressView().frame(maxWidth: .infinity) }
                     else { Label("Search destination", systemImage: "magnifyingglass").frame(maxWidth: .infinity) }
                 }
-                .buttonStyle(VoltPrimaryButtonStyle())
+                .buttonStyle(.glassProminent)
+                .tint(.voltBlue)
                 .disabled(isSearching || destinationQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
@@ -967,7 +1047,8 @@ struct TripPlannerView: View {
                     if isPlanning || store.isLoadingStations { ProgressView().frame(maxWidth: .infinity) }
                     else { Label("Find chargers along route", systemImage: "point.topleft.down.to.point.bottomright.curvepath").frame(maxWidth: .infinity) }
                 }
-                .buttonStyle(VoltPrimaryButtonStyle())
+                .buttonStyle(.glassProminent)
+                .tint(.voltBlue)
                 .disabled(isPlanning || store.isLoadingStations || store.profile.connectors.isEmpty)
                 if store.isLoadingStations {
                     Text("Loading compatible chargers…").font(.caption).foregroundStyle(.secondary)
@@ -975,6 +1056,7 @@ struct TripPlannerView: View {
                 if store.profile.connectors.isEmpty {
                     Button("Set up vehicle connectors") { showingVehicleProfile = true }
                         .font(.subheadline.weight(.semibold))
+                        .buttonStyle(.glass)
                 }
             }
         }
@@ -1005,6 +1087,7 @@ struct TripPlannerView: View {
                     ForEach(routeStops, id: \.station.id) { stop in
                         NavigationLink {
                             StationDetailView(station: stop.station, store: store)
+                                .navigationTransition(.zoom(sourceID: stop.station.id, in: stationTransition))
                         } label: {
                             VStack(alignment: .leading, spacing: 7) {
                                 StationRow(station: stop.station, distance: nil, isFavorite: store.favoriteStationIDs.contains(stop.station.id))
@@ -1013,6 +1096,7 @@ struct TripPlannerView: View {
                                     .foregroundStyle(.secondary)
                                     .padding(.leading, 10)
                             }
+                            .matchedTransitionSource(id: stop.station.id, in: stationTransition)
                         }
                         .buttonStyle(.plain)
                         Divider()
@@ -1135,6 +1219,7 @@ struct TripPlannerView: View {
 
 struct FavoritesView: View {
     let store: VoltWayStore
+    @Namespace private var stationTransition
 
     var body: some View {
         ScrollView {
@@ -1157,8 +1242,10 @@ struct FavoritesView: View {
                     ForEach(store.favoriteStations) { station in
                         NavigationLink {
                             StationDetailView(station: station, store: store)
+                                .navigationTransition(.zoom(sourceID: station.id, in: stationTransition))
                         } label: {
                             StationRow(station: station, distance: station.distance(from: store.currentLocation), isFavorite: true)
+                                .matchedTransitionSource(id: station.id, in: stationTransition)
                         }
                         .buttonStyle(.plain)
                         Divider().padding(.leading, 58)
@@ -1176,6 +1263,7 @@ struct FavoritesView: View {
 struct AccountView: View {
     let store: VoltWayStore
     @State private var showingVehicleProfile = false
+    @Namespace private var vehicleTransition
 
     var body: some View {
         List {
@@ -1185,6 +1273,7 @@ struct AccountView: View {
                 } label: {
                     Label(store.profileSummary.isEmpty ? "Set up vehicle" : store.profileSummary, systemImage: "car.side")
                 }
+                .matchedTransitionSource(id: "vehicle", in: vehicleTransition)
             }
 
             Section("Privacy") {
@@ -1213,6 +1302,7 @@ struct AccountView: View {
         .sheet(isPresented: $showingVehicleProfile) {
             NavigationStack { VehicleProfileView(store: store) }
                 .presentationDetents([.medium, .large])
+                .navigationTransition(.zoom(sourceID: "vehicle", in: vehicleTransition))
         }
     }
 }
@@ -1318,7 +1408,7 @@ struct EmptyState: View {
                     .multilineTextAlignment(.center)
                 if let actionTitle, let action {
                     Button(actionTitle, action: action)
-                        .buttonStyle(VoltGlassButtonStyle())
+                        .buttonStyle(.glass)
                 }
             }
             .frame(maxWidth: .infinity)

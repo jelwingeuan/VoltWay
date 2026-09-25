@@ -33,49 +33,6 @@ struct VoltSurface<Content: View>: View {
     }
 }
 
-struct VoltPrimaryButtonStyle: ButtonStyle {
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(.body.weight(.semibold))
-            .foregroundStyle(.white)
-            .frame(maxWidth: .infinity, minHeight: 52)
-            .padding(.horizontal, 18)
-            .background(Color.voltBlue.opacity(configuration.isPressed ? 0.82 : 1))
-            .clipShape(.rect(cornerRadius: 16))
-            .scaleEffect(configuration.isPressed ? 0.97 : 1)
-            .animation(reduceMotion ? nil : .easeOut(duration: 0.14), value: configuration.isPressed)
-    }
-}
-
-struct VoltGlassButtonStyle: ButtonStyle {
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(.subheadline.weight(.semibold))
-            .frame(minHeight: 46)
-            .padding(.horizontal, 15)
-            .voltGlassControl(isPressed: configuration.isPressed)
-            .scaleEffect(configuration.isPressed ? 0.97 : 1)
-            .animation(reduceMotion ? nil : .easeOut(duration: 0.14), value: configuration.isPressed)
-    }
-}
-
-private extension View {
-    @ViewBuilder
-    func voltGlassControl(isPressed: Bool) -> some View {
-        if #available(iOS 26.0, *) {
-            glassEffect(.regular.tint(Color.voltBlue.opacity(0.15)).interactive(), in: .capsule)
-        } else {
-            background(.ultraThinMaterial)
-                .clipShape(Capsule())
-                .overlay { Capsule().stroke(Color.primary.opacity(isPressed ? 0.16 : 0.09), lineWidth: 1) }
-        }
-    }
-}
-
 struct AvailabilityPill: View {
     let availability: Availability
 
