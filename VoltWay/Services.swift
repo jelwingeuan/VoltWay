@@ -35,6 +35,12 @@ enum BackendError: LocalizedError, Equatable {
     }
 }
 
+struct StationFetchResult: Decodable, Sendable {
+    let stations: [ChargingStation]
+    let warnings: [String]?
+    let catalogSyncedAt: Date?
+}
+
 actor BackendClient {
     private let configuration: AppConfiguration
     private let urlSession: URLSession
@@ -50,7 +56,15 @@ actor BackendClient {
         self.credentialAccount = credentialAccount
 
         let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
+        decoder.dateDecodingStrategy = .custom { decoder in
+            let container = try decoder.singleValueContainer()
+            let value = try container.decode(String.self)
+            guard let date = (try? Date.ISO8601FormatStyle(includingFractionalSeconds: true).parse(value))
+                ?? (try? Date.ISO8601FormatStyle().parse(value)) else {
+                throw DecodingError.dataCorruptedError(in: container, debugDescription: "Invalid ISO 8601 date")
+            }
+            return date
+        }
         self.decoder = decoder
 
         let encoder = JSONEncoder()
@@ -107,21 +121,21 @@ actor BackendClient {
         refreshTask = nil
     }
 
-    func stations(profile: VehicleProfile, session: UserSession?) async throws -> [ChargingStation] {
-        guard configuration.isConfigured else { return DemoData.stations }
+    func stations(profile: VehicleProfile, session: UserSession?) async throws -> StationFetchResult {
+        guard configuration.isConfigured else { return StationFetchResult(stations: DemoData.stations, warnings: nil, catalogSyncedAt: nil) }
         guard let session else { throw BackendError.missingSession }
 
         var queryItems = [URLQueryItem(name: "connectors", value: profile.connectors.map(\.rawValue).joined(separator: ","))]
         if let minimumPowerKW = profile.minimumPowerKW {
             queryItems.append(URLQueryItem(name: "minimumPowerKW", value: String(minimumPowerKW)))
         }
-        let response: StationResponse = try await request(
+        let response: StationFetchResult = try await request(
             path: "functions/v1/stations",
             method: "GET",
             queryItems: queryItems,
             session: session
         )
-        return response.stations
+        return response
     }
 
     func loadProfile(session: UserSession) async throws -> VehicleProfile? {
@@ -330,7 +344,6 @@ private struct RefreshRequest: Encodable {
     enum CodingKeys: String, CodingKey { case refreshToken = "refresh_token" }
 }
 private struct RecoveryRequest: Encodable { let email: String }
-private struct StationResponse: Decodable { let stations: [ChargingStation] }
 private struct EmptyResponse: Codable {}
 
 private struct AuthResponse: Decodable {
@@ -510,8 +523,8 @@ enum MapsHandoff {
 enum CarPlaySnapshotStore {
     private static let key = "carplay-snapshot"
 
-    static func save(stations: [ChargingStation], favoriteStationIDs: Set<String>, defaults: UserDefaults = .standard) {
-        let snapshot = CarPlaySnapshot(stations: stations, favoriteStationIDs: favoriteStationIDs, savedAt: .now)
+    static func save(stations: [ChargingStation], favoriteStationIDs: Set<String>, isDemo: Bool = false, defaults: UserDefaults = .standard) {
+        let snapshot = CarPlaySnapshot(stations: stations, favoriteStationIDs: favoriteStationIDs, savedAt: .now, isDemo: isDemo)
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         defaults.set(try? encoder.encode(snapshot), forKey: key)

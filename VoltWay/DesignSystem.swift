@@ -33,6 +33,14 @@ struct VoltSurface<Content: View>: View {
     }
 }
 
+struct DemoNotice: View {
+    var body: some View {
+        Label("Demo data, not live", systemImage: "info.circle")
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
+    }
+}
+
 struct AvailabilityPill: View {
     let availability: Availability
 

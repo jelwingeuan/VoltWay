@@ -1,2 +1,5 @@
 [functions.stations]
 verify_jwt = true
+
+[functions.sync-ocm]
+verify_jwt = false

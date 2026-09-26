@@ -31,7 +31,7 @@ struct VehicleProfile: Codable, Equatable, Sendable {
     var minimumPowerKW: Double?
     var updatedAt: Date?
 
-    static let demo = VehicleProfile(connectors: [.type2, .ccs2], minimumPowerKW: 50)
+    static let demo = VehicleProfile(connectors: [.type2, .ccs2], minimumPowerKW: nil)
 
     enum CodingKeys: String, CodingKey {
         case userID = "user_id"
@@ -43,7 +43,7 @@ struct VehicleProfile: Codable, Equatable, Sendable {
     func accepts(_ station: ChargingStation) -> Bool {
         let matchesConnector = !Set(connectors).isDisjoint(with: station.connectors.map(\.kind))
         let meetsPower = minimumPowerKW.map { minimum in
-            station.connectors.contains { $0.powerKW >= minimum && connectors.contains($0.kind) }
+            station.connectors.contains { ($0.powerKW ?? 0) >= minimum && connectors.contains($0.kind) }
         } ?? true
         return matchesConnector && meetsPower
     }
@@ -60,8 +60,20 @@ struct Coordinate: Codable, Equatable, Hashable, Sendable {
 
 struct Connector: Codable, Equatable, Hashable, Sendable {
     let kind: ConnectorKind
-    let powerKW: Double
-    let count: Int
+    let powerKW: Double?
+    let count: Int?
+}
+
+enum StationSource: String, Codable, Equatable, Hashable, Sendable {
+    case gentari
+    case openChargeMap
+
+    var attribution: String {
+        switch self {
+        case .gentari: "Gentari partner feed"
+        case .openChargeMap: "Open Charge Map · CC BY 4.0"
+        }
+    }
 }
 
 enum AvailabilityState: String, Codable, Equatable, Hashable, Sendable {
@@ -231,16 +243,38 @@ struct ChargingStation: Codable, Equatable, Hashable, Identifiable, Sendable {
     let connectors: [Connector]
     let availability: Availability
     let price: Price?
+    var source: StationSource? = nil
 
-    var maximumPowerKW: Double {
-        connectors.map(\.powerKW).max() ?? 0
+    var networkName: String {
+        switch operatorName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "gentari", "gentari go (my)": "Gentari"
+        case "shell recharge", "shell recharge (malaysia)": "Shell Recharge"
+        case "tnb electron", "tnb electron (my)": "TNB Electron"
+        case "jom charge", "jomcharge": "JomCharge"
+        case "chargev", "chargeev", "chargeev (my)": "chargEV"
+        case "chargesini": "ChargeSini"
+        case "evpower", "evpower (my)": "EVPower"
+        default: operatorName.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+    }
+
+    var maximumPowerKW: Double? {
+        connectors.compactMap(\.powerKW).max()
     }
 
     var connectorSummary: String {
         connectors
-            .sorted { $0.powerKW > $1.powerKW }
-            .map { "\($0.kind.title) \($0.powerKW.formatted(.number.precision(.fractionLength(0)))) kW" }
+            .sorted { ($0.powerKW ?? -1) > ($1.powerKW ?? -1) }
+            .map { connector in
+                guard let powerKW = connector.powerKW else { return "\(connector.kind.title) · Power unavailable" }
+                return "\(connector.kind.title) \(powerKW.formatted(.number.precision(.fractionLength(0)))) kW"
+            }
             .joined(separator: " · ")
+    }
+
+    var sourceURL: URL? {
+        guard source == .openChargeMap, id.hasPrefix("ocm:") else { return nil }
+        return URL(string: "https://openchargemap.org/poi/details/\(id.dropFirst(4))")
     }
 
     func distance(from coordinate: Coordinate?) -> CLLocationDistance? {
@@ -290,6 +324,7 @@ enum StationDiscovery {
         from stations: [ChargingStation],
         query: String,
         availableNowOnly: Bool,
+        network: String? = nil,
         now: Date = .now
     ) -> [ChargingStation] {
         let search = query.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -297,9 +332,21 @@ enum StationDiscovery {
             let matchesSearch = search.isEmpty
                 || station.name.localizedStandardContains(search)
                 || station.address.localizedStandardContains(search)
+                || station.operatorName.localizedStandardContains(search)
+                || station.networkName.localizedStandardContains(search)
             let matchesAvailability = !availableNowOnly || station.availability.isReportedAvailable(at: now)
-            return matchesSearch && matchesAvailability
+            return matchesSearch && matchesAvailability && (network == nil || station.networkName == network)
         }
+    }
+
+    static func networks(from stations: [ChargingStation]) -> [String] {
+        let priority = ["Shell Recharge": 0, "TNB Electron": 1, "Gentari": 2]
+        return Array(Set(stations.map(\.networkName)))
+            .sorted {
+                let first = priority[$0] ?? Int.max
+                let second = priority[$1] ?? Int.max
+                return first == second ? $0.localizedStandardCompare($1) == .orderedAscending : first < second
+            }
     }
 
     static func nearbyAlternatives(
@@ -336,6 +383,26 @@ struct CarPlaySnapshot: Codable, Equatable, Sendable {
     let stations: [ChargingStation]
     let favoriteStationIDs: Set<String>
     let savedAt: Date
+    let isDemo: Bool
+
+    init(stations: [ChargingStation], favoriteStationIDs: Set<String>, savedAt: Date, isDemo: Bool = false) {
+        self.stations = stations
+        self.favoriteStationIDs = favoriteStationIDs
+        self.savedAt = savedAt
+        self.isDemo = isDemo
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case stations, favoriteStationIDs, savedAt, isDemo
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        stations = try values.decode([ChargingStation].self, forKey: .stations)
+        favoriteStationIDs = try values.decode(Set<String>.self, forKey: .favoriteStationIDs)
+        savedAt = try values.decode(Date.self, forKey: .savedAt)
+        isDemo = try values.decodeIfPresent(Bool.self, forKey: .isDemo) ?? false
+    }
 }
 
 enum DemoData {
@@ -348,7 +415,8 @@ enum DemoData {
             operatorName: "Gentari",
             connectors: [Connector(kind: .ccs2, powerKW: 180, count: 2), Connector(kind: .type2, powerKW: 22, count: 2)],
             availability: Availability(state: .available, availableConnectors: 2, totalConnectors: 4, lastUpdated: .now),
-            price: Price(amountMYR: Decimal(string: "1.50")!, unit: .kWh, lastUpdated: .now)
+            price: Price(amountMYR: Decimal(string: "1.50")!, unit: .kWh, lastUpdated: .now),
+            source: .gentari
         ),
         ChargingStation(
             id: "gentari-mid-valley",
@@ -358,7 +426,8 @@ enum DemoData {
             operatorName: "Gentari",
             connectors: [Connector(kind: .ccs2, powerKW: 120, count: 2), Connector(kind: .type2, powerKW: 22, count: 4)],
             availability: Availability(state: .occupied, availableConnectors: 0, totalConnectors: 6, lastUpdated: .now),
-            price: Price(amountMYR: Decimal(string: "1.40")!, unit: .kWh, lastUpdated: .now)
+            price: Price(amountMYR: Decimal(string: "1.40")!, unit: .kWh, lastUpdated: .now),
+            source: .gentari
         ),
         ChargingStation(
             id: "gentari-klcc",
@@ -368,7 +437,8 @@ enum DemoData {
             operatorName: "Gentari",
             connectors: [Connector(kind: .type2, powerKW: 22, count: 6)],
             availability: Availability(state: .available, availableConnectors: 3, totalConnectors: 6, lastUpdated: .now),
-            price: Price(amountMYR: Decimal(string: "0.10")!, unit: .minute, lastUpdated: .now)
+            price: Price(amountMYR: Decimal(string: "0.10")!, unit: .minute, lastUpdated: .now),
+            source: .gentari
         ),
         ChargingStation(
             id: "gentari-bangsar",
@@ -378,7 +448,78 @@ enum DemoData {
             operatorName: "Gentari",
             connectors: [Connector(kind: .ccs2, powerKW: 60, count: 2)],
             availability: Availability(state: .offline, availableConnectors: 0, totalConnectors: 2, lastUpdated: .now),
-            price: nil
+            price: nil,
+            source: .gentari
+        ),
+        ChargingStation(
+            id: "ocm:505443",
+            name: "DC Handal | IOI Mall Damansara",
+            address: "Persiaran Surian, Petaling Jaya",
+            coordinate: Coordinate(latitude: 3.1488504, longitude: 101.5946795),
+            operatorName: "DC Handal",
+            connectors: [Connector(kind: .ccs2, powerKW: 240, count: 4)],
+            availability: Availability(state: .unknown, availableConnectors: nil, totalConnectors: nil, lastUpdated: nil),
+            price: nil,
+            source: .openChargeMap
+        ),
+        ChargingStation(
+            id: "ocm:470421",
+            name: "EVPower - 168 Park Mall Selayang",
+            address: "Batu Caves, Selangor",
+            coordinate: Coordinate(latitude: 3.2480458, longitude: 101.6491125),
+            operatorName: "EVPower",
+            connectors: [Connector(kind: .ccs2, powerKW: 180, count: 5)],
+            availability: Availability(state: .unknown, availableConnectors: nil, totalConnectors: nil, lastUpdated: nil),
+            price: nil,
+            source: .openChargeMap
+        ),
+        directoryStation(
+            id: 279460, name: "Pavilion KL", address: "168 Jalan Bukit Bintang, Kuala Lumpur",
+            latitude: 3.1506265487112097, longitude: 101.70763605512641, operatorName: "Shell Recharge (Malaysia)",
+            connectors: [Connector(kind: .ccs2, powerKW: 60, count: 2), Connector(kind: .type2, powerKW: 22, count: 2)]
+        ),
+        directoryStation(
+            id: 479684, name: "Shell LPT 1 RNR Temerloh KTN Bound", address: "KM 129.5 East Bound, Temerloh, Pahang",
+            latitude: 3.512228012084961, longitude: 102.44186401367188, operatorName: "Shell Recharge (Malaysia)",
+            connectors: [Connector(kind: .ccs2, powerKW: 180, count: 2)]
+        ),
+        directoryStation(
+            id: 480555, name: "TNB Electron - Wisma TNB Bagan Serai", address: "Jalan Taiping Batu 10, Bagan Serai, Perak",
+            latitude: 5.0058708, longitude: 100.5426283, operatorName: "TNB Electron (MY)",
+            connectors: [Connector(kind: .ccs2, powerKW: 240, count: 3)]
+        ),
+        directoryStation(
+            id: 480140, name: "TNB Electron - Yard TNB PRCC Bayan Lepas", address: "Lebuhraya Kampung Jawa, Bayan Lepas, Penang",
+            latitude: 5.316405322200055, longitude: 100.2957099672758, operatorName: "TNB Electron (MY)",
+            connectors: [Connector(kind: .ccs2, powerKW: 200, count: 5)]
+        ),
+        directoryStation(
+            id: 505071, name: "JomCharge | TTDI CU Mart", address: "11 Jalan Tun Mohd Fuad, Kuala Lumpur",
+            latitude: 3.14157273674428, longitude: 101.62850289430958, operatorName: "Jom Charge",
+            connectors: [Connector(kind: .ccs2, powerKW: 120, count: 2), Connector(kind: .type2, powerKW: 7, count: 1)]
+        ),
+        directoryStation(
+            id: 497573, name: "chargeEV | TF Value-Mart Gemas", address: "33 Jalan DS 2/2, Gemas, Negeri Sembilan",
+            latitude: 2.5864782970035662, longitude: 102.57496456588626, operatorName: "chargeEV (MY)",
+            connectors: [Connector(kind: .ccs2, powerKW: 60, count: 2)]
+        ),
+        directoryStation(
+            id: 259727, name: "ChargeSini Station Starbucks Megamall", address: "Berjaya Megamall, Kuantan, Pahang",
+            latitude: 3.8151167582230556, longitude: 103.32983248955486, operatorName: "ChargeSini",
+            connectors: [Connector(kind: .type2, powerKW: 11, count: 1), Connector(kind: .type2, powerKW: 22, count: 1)]
         )
     ]
+
+    private static func directoryStation(
+        id: Int, name: String, address: String, latitude: Double, longitude: Double,
+        operatorName: String, connectors: [Connector]
+    ) -> ChargingStation {
+        ChargingStation(
+            id: "ocm:\(id)", name: name, address: address,
+            coordinate: Coordinate(latitude: latitude, longitude: longitude), operatorName: operatorName,
+            connectors: connectors,
+            availability: Availability(state: .unknown, availableConnectors: nil, totalConnectors: nil, lastUpdated: nil),
+            price: nil, source: .openChargeMap
+        )
+    }
 }

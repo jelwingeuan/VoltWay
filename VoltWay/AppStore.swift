@@ -10,6 +10,8 @@ final class VoltWayStore {
     private(set) var favorites: [FavoriteStation] = []
     private(set) var currentLocation: Coordinate?
     private(set) var lastSuccessfulStationFetchAt: Date?
+    private(set) var catalogSyncedAt: Date?
+    private(set) var sourceWarnings: [String] = []
     private(set) var isBootstrapping = true
     private(set) var isLoadingStations = false
     private(set) var isAuthenticating = false
@@ -129,6 +131,8 @@ final class VoltWayStore {
             favorites = []
             currentLocation = nil
             lastSuccessfulStationFetchAt = nil
+            catalogSyncedAt = nil
+            sourceWarnings = []
             CarPlaySnapshotStore.clear()
         } catch {
             show(error)
@@ -139,7 +143,10 @@ final class VoltWayStore {
         isLoadingStations = true
         defer { isLoadingStations = false }
         do {
-            stations = try await backend.stations(profile: profile, session: session)
+            let result = try await backend.stations(profile: profile, session: session)
+            stations = result.stations
+            sourceWarnings = result.warnings ?? []
+            catalogSyncedAt = result.catalogSyncedAt
             if !isDemoMode { lastSuccessfulStationFetchAt = .now }
             errorMessage = nil
             persistCarPlaySnapshot()
@@ -172,6 +179,8 @@ final class VoltWayStore {
 
         let previous = profile
         let previousFetchAt = lastSuccessfulStationFetchAt
+        let previousCatalogSyncAt = catalogSyncedAt
+        let previousSourceWarnings = sourceWarnings
         profile = VehicleProfile(
             userID: session?.userID,
             connectors: connectors.sorted { $0.rawValue < $1.rawValue },
@@ -188,6 +197,8 @@ final class VoltWayStore {
         } catch {
             profile = previous
             lastSuccessfulStationFetchAt = previousFetchAt
+            catalogSyncedAt = previousCatalogSyncAt
+            sourceWarnings = previousSourceWarnings
             persistCarPlaySnapshot()
             show(error)
             return false
@@ -232,7 +243,7 @@ final class VoltWayStore {
     }
 
     private func persistCarPlaySnapshot() {
-        CarPlaySnapshotStore.save(stations: compatibleStations, favoriteStationIDs: favoriteStationIDs)
+        CarPlaySnapshotStore.save(stations: compatibleStations, favoriteStationIDs: favoriteStationIDs, isDemo: isDemoMode)
     }
 
     private func show(_ error: any Error) {

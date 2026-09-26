@@ -45,12 +45,12 @@ final class CarPlaySceneDelegate: NSObject, CPTemplateApplicationSceneDelegate {
         }
 
         let title = coordinate == nil ? "Chargers" : "Nearby"
-        let nearby = listTemplate(title: title, stations: stations)
+        let nearby = listTemplate(title: title, stations: stations, isDemo: snapshot.isDemo)
         nearby.tabTitle = title
         nearby.tabImage = UIImage(systemName: "bolt.car")
 
         let favorites = stations.filter { snapshot.favoriteStationIDs.contains($0.id) }
-        let saved = listTemplate(title: "Saved", stations: favorites)
+        let saved = listTemplate(title: "Saved", stations: favorites, isDemo: snapshot.isDemo)
         saved.tabTitle = "Saved"
         saved.tabImage = UIImage(systemName: "heart.fill")
 
@@ -73,13 +73,14 @@ final class CarPlaySceneDelegate: NSObject, CPTemplateApplicationSceneDelegate {
         showLists(from: CarPlaySnapshotStore.load(), near: currentCoordinate)
     }
 
-    private func listTemplate(title: String, stations: [ChargingStation]) -> CPListTemplate {
+    private func listTemplate(title: String, stations: [ChargingStation], isDemo: Bool) -> CPListTemplate {
         let items = stations.prefix(12).map { station in
-            let detail = "\(station.availability.displayText()) · \(station.price?.displayText() ?? "Price unavailable")"
+            let prefix = isDemo ? "Demo · " : ""
+            let detail = "\(prefix)\(station.networkName) · \(station.availability.displayText()) · \(station.price?.displayText() ?? "Price unavailable")"
             let item = CPListItem(text: station.name, detailText: detail, image: UIImage(systemName: "bolt.fill"))
             item.accessoryType = .disclosureIndicator
             item.handler = { [weak self] _, completion in
-                self?.showDetails(for: station)
+                self?.showDetails(for: station, isDemo: isDemo)
                 completion()
             }
             return item
@@ -100,16 +101,21 @@ final class CarPlaySceneDelegate: NSObject, CPTemplateApplicationSceneDelegate {
         return CPListTemplate(title: title, sections: [section])
     }
 
-    private func showDetails(for station: ChargingStation) {
-        let information = [
+    private func showDetails(for station: ChargingStation, isDemo: Bool) {
+        var information = [
+            CPInformationItem(title: "Network", detail: station.networkName),
             CPInformationItem(title: "Status", detail: station.availability.displayText()),
             CPInformationItem(title: "Price", detail: station.price?.displayText() ?? "Price unavailable"),
-            CPInformationItem(title: "Connectors", detail: station.connectorSummary),
             CPInformationItem(title: "Status updated", detail: updateText(station.availability.lastUpdated)),
             CPInformationItem(title: "Price updated", detail: updateText(station.price?.lastUpdated)),
+            CPInformationItem(title: "Connectors", detail: station.connectorSummary),
+            CPInformationItem(title: "Data source", detail: station.source?.attribution ?? "Unavailable"),
             CPInformationItem(title: "Address", detail: station.address)
         ]
-        let navigate = CPTextButton(title: "Navigate in Maps", textStyle: .confirm) { _ in
+        if isDemo {
+            information.insert(CPInformationItem(title: "Demo", detail: "Location example, not live status or price"), at: 0)
+        }
+        let navigate = CPTextButton(title: "Open Apple Maps", textStyle: .confirm) { _ in
             MapsHandoff.open(station)
         }
         let template = CPInformationTemplate(title: station.name, layout: .leading, items: information, actions: [navigate])
