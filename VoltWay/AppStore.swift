@@ -14,6 +14,8 @@ final class VoltWayStore {
     private(set) var lastSuccessfulStationFetchAt: Date?
     private(set) var catalogSyncedAt: Date?
     private(set) var catalogImportReport: CatalogImportReport?
+    private(set) var mevnetSyncedAt: Date?
+    private(set) var mevnetImportReport: MEVnetImportReport?
     private(set) var duplicateCount = 0
     private(set) var sourceWarnings: [String] = []
     private(set) var isBootstrapping = true
@@ -49,8 +51,8 @@ final class VoltWayStore {
         return favorites.compactMap { favorite in
             if let current = stations.first(where: { $0.id == favorite.stationID }) { return current }
             // A directory snapshot cannot prove a site is still public or licensed after it leaves the catalog.
-            return favorite.stationSnapshot.source == .openChargeMap || favorite.stationSnapshot.source == .ownerProvided
-                || favorite.stationID.hasPrefix("ocm:") || favorite.stationID.hasPrefix("private:")
+            return favorite.stationSnapshot.source == .openChargeMap || favorite.stationSnapshot.source == .mevnet || favorite.stationSnapshot.source == .ownerProvided
+                || favorite.stationID.hasPrefix("ocm:") || favorite.stationID.hasPrefix("mevnet:") || favorite.stationID.hasPrefix("private:")
                 ? nil : favorite.stationSnapshot
         }
     }
@@ -146,6 +148,8 @@ final class VoltWayStore {
             lastSuccessfulStationFetchAt = nil
             catalogSyncedAt = nil
             catalogImportReport = nil
+            mevnetSyncedAt = nil
+            mevnetImportReport = nil
             duplicateCount = 0
             sourceWarnings = []
             CarPlaySnapshotStore.clear()
@@ -163,6 +167,8 @@ final class VoltWayStore {
             sourceWarnings = result.warnings ?? []
             catalogSyncedAt = result.catalogSyncedAt
             catalogImportReport = result.catalogImportReport
+            mevnetSyncedAt = result.mevnetSyncedAt
+            mevnetImportReport = result.mevnetImportReport
             duplicateCount = result.duplicateCount ?? 0
             if !isDemoMode { lastSuccessfulStationFetchAt = .now }
             errorMessage = nil

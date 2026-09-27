@@ -50,6 +50,38 @@ struct VoltWayTests {
         #expect(unknown.connectorSummary == "Connector details unavailable")
     }
 
+    @Test("MEVnet planning sites decode without invented connectors and proposed sites stay opt-in")
+    func mevnetPlanningRecords() throws {
+        let payload = #"{"id":"mevnet:4","name":"City Mall","address":"Selangor","coordinate":{"latitude":3.14,"longitude":101.68},"operatorName":"Gentari","connectors":[],"availability":{"state":"unknown","availableConnectors":null,"totalConnectors":null,"lastUpdated":null},"price":null,"source":"mevnet","lifecycle":"proposed","acCount":2,"dcCount":1,"sourceSequence":4,"stateCode":10,"pbtCode":17,"indoorOutdoor":"Indoor","sourceIDs":{"mevnet":"4"}}"#
+        let record = try JSONDecoder().decode(ChargingStation.self, from: Data(payload.utf8))
+        #expect(record.lifecycle == .proposed)
+        #expect(record.acCount == 2)
+        #expect(record.sourceSequence == 4)
+        #expect(record.stateCode == 10)
+        #expect(record.pbtCode == 17)
+        #expect(record.indoorOutdoor == "Indoor")
+        #expect(record.connectorSummary == "Connector details unavailable")
+        #expect(!VehicleProfile.demo.accepts(record))
+        #expect(StationDiscovery.visibleStations(from: [record], query: "", availableNowOnly: false,
+            showAll: true).isEmpty)
+        #expect(StationDiscovery.visibleStations(from: [record], query: "", availableNowOnly: false,
+            showAll: true, includeProposed: true).map(\.id) == ["mevnet:4"])
+        #expect(StationDiscovery.visibleStations(from: [record], query: "", availableNowOnly: true,
+            showAll: true, includeProposed: true).isEmpty)
+    }
+
+    @Test("Catalog response keeps MEVnet accounting separate from OCM and tolerates older station snapshots")
+    func mevnetCoverageDecoding() throws {
+        let payload = #"{"stations":[],"mevnetSyncedAt":"2026-09-28T00:00:00Z","mevnetImportReport":{"fetched":3,"included":2,"existing":1,"proposed":1,"unknown":0,"invalid":1,"private":0,"states":{"PERAK":{"fetched":3,"included":2,"proposed":1,"invalid":1,"private":0}}}}"#
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let response = try decoder.decode(StationFetchResult.self, from: Data(payload.utf8))
+        #expect(response.mevnetImportReport?.fetched == 3)
+        #expect(response.mevnetImportReport?.states["PERAK"]?.proposed == 1)
+        let legacy = try decoder.decode(StationFetchResult.self, from: Data(#"{"stations":[]}"#.utf8))
+        #expect(legacy.mevnetImportReport == nil)
+    }
+
     @Test("Quick filters share map and list results without treating directory status as live")
     func quickDiscoveryFilters() {
         let ac = ChargingStation(
@@ -157,6 +189,18 @@ struct VoltWayTests {
         #expect(shell.sites == 2)
         #expect(shell.knownChargePoints == 2)
         #expect(shell.sitesWithoutChargePointCount == 1)
+    }
+
+    @Test("Network coverage separates proposed sites from existing directory locations")
+    func proposedCoverageCounts() throws {
+        let shellStations = DemoData.stations.filter { $0.networkName == "Shell Recharge" }
+        #expect(shellStations.count == 2)
+        var planned = shellStations[0]
+        planned.lifecycle = .proposed
+        let summary = try #require(CatalogCoverage.networks(in: [planned, shellStations[1]]).first)
+        #expect(summary.sites == 2)
+        #expect(summary.proposedSites == 1)
+        #expect(summary.otherSites == 1)
     }
 
     @Test("Network aliases produce one filter choice and identical map/list results")
@@ -634,6 +678,9 @@ struct BackendClientTests {
         let id = UUID(uuidString: "00000000-0000-0000-0000-000000000042")!
         let client = makeClient(account: "test-\(UUID().uuidString)")
         MockURLProtocol.handler = { request in
+            if request.url?.path == "/auth/v1/token" {
+                return (200, Data(#"{"access_token":"caller-token","refresh_token":"refresh","user":{"id":"user-1","email":"owner@example.com"}}"#.utf8))
+            }
             #expect(request.url?.path == "/rest/v1/rpc/create_private_charger_site")
             #expect(request.httpMethod == "POST")
             #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer caller-token")
@@ -648,10 +695,12 @@ struct BackendClientTests {
         }
         defer { MockURLProtocol.handler = nil }
 
+        let session = try await client.signIn(email: "owner@example.com", password: "password-123")
         try await client.createPrivateSite(
             id: id, station: station, invitedEmail: "guest@example.com",
-            session: UserSession(userID: "user-1", email: "owner@example.com", accessToken: "caller-token", refreshToken: "refresh")
+            session: session
         )
+        try await client.signOut()
     }
 
     @Test("Concurrent expired-token requests share one refresh and persist rotated tokens")

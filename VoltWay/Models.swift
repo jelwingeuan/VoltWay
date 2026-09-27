@@ -98,6 +98,27 @@ struct CatalogExcludedIDs: Decodable, Sendable {
     let license: [Int]?
 }
 
+struct MEVnetImportReport: Decodable, Sendable {
+    let fetched: Int
+    let included: Int
+    let existing: Int
+    let proposed: Int
+    let unknown: Int
+    let invalid: Int
+    let `private`: Int?
+    let accessUnverified: Int?
+    let states: [String: MEVnetStateReport]
+}
+
+struct MEVnetStateReport: Decodable, Sendable {
+    let fetched: Int
+    let included: Int
+    let proposed: Int
+    let invalid: Int
+    let `private`: Int?
+    let accessUnverified: Int?
+}
+
 struct Coordinate: Codable, Equatable, Hashable, Sendable {
     let latitude: Double
     let longitude: Double
@@ -117,12 +138,14 @@ enum StationSource: String, Codable, Equatable, Hashable, Sendable {
     case gentari
     case openChargeMap
     case ownerProvided
+    case mevnet
 
     var attribution: String {
         switch self {
         case .gentari: "Gentari partner feed"
         case .openChargeMap: "Open Charge Map · CC BY 4.0"
         case .ownerProvided: "Owner supplied · private sharing"
+        case .mevnet: "PLANMalaysia MEVnet · planning catalog"
         }
     }
 }
@@ -320,18 +343,40 @@ struct ChargingStation: Codable, Equatable, Hashable, Identifiable, Sendable {
     var sourceAttribution: String? = nil
     var access: StationAccess? = nil
     var chargePointCount: Int? = nil
+    var state: String? = nil
+    var sourceSequence: Int? = nil
+    var stateCode: Int? = nil
+    var pbtCode: Int? = nil
+    var pbt: String? = nil
+    var indoorOutdoor: String? = nil
+    var lifecycle: StationLifecycle? = nil
+    var acCount: Int? = nil
+    var dcCount: Int? = nil
+    var proposedChargePointCount: Int? = nil
+    var indoorCount: Int? = nil
+    var outdoorCount: Int? = nil
+    var category: String? = nil
+    var networkCounts: [String: Int]? = nil
+    var sourceIDs: [String: String]? = nil
+    var sourceAttributions: [String]? = nil
+    var sourceUpdatedAt: Date? = nil
 
-    var attributionText: String? { sourceAttribution ?? source?.attribution }
+    var attributionText: String? { sourceAttributions?.joined(separator: " · ") ?? sourceAttribution ?? source?.attribution }
 
     var networkName: String {
         switch operatorName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "gentari", "gentari go (my)": "Gentari"
-        case "shell recharge", "shell recharge (malaysia)": "Shell Recharge"
-        case "tnb electron", "tnb electron (my)": "TNB Electron"
+        case "gentari", "gentari go", "gentari go (my)": "Gentari"
+        case "shell recharge", "shell recharge (malaysia)", "parkeasy": "Shell Recharge"
+        case "tnb electron", "tnb electron (my)", "tnbx", "tnbx electron", "tnb electron / tnbx / go to-u": "TNB Electron"
         case "jom charge", "jomcharge": "JomCharge"
         case "chargev", "chargeev", "chargeev (my)": "chargEV"
         case "chargesini": "ChargeSini"
+        case "handal green mobility", "dc handal": "DC Handal"
         case "evpower", "evpower (my)": "EVPower"
+        case "tesla", "tesla supercharger": "Tesla"
+        case "charge n go", "chargengo", "charge n' go": "Charge N Go"
+        case "go to-u", "go to u", "gotou": "Go To-U"
+        case "charge+", "charge plus": "Charge+"
         default: operatorName.trimmingCharacters(in: .whitespacesAndNewlines)
         }
     }
@@ -352,8 +397,11 @@ struct ChargingStation: Codable, Equatable, Hashable, Identifiable, Sendable {
     }
 
     var sourceURL: URL? {
-        guard source == .openChargeMap, id.hasPrefix("ocm:") else { return nil }
-        return URL(string: "https://openchargemap.org/poi/details/\(id.dropFirst(4))")
+        if let ocmID = sourceIDs?["openChargeMap"] ?? sourceIDs?["ocm"] {
+            return URL(string: "https://openchargemap.org/poi/details/\(ocmID.replacingOccurrences(of: "ocm:", with: ""))")
+        }
+        if id.hasPrefix("ocm:") { return URL(string: "https://openchargemap.org/poi/details/\(id.dropFirst(4))") }
+        return nil
     }
 
     func distance(from coordinate: Coordinate?) -> CLLocationDistance? {
@@ -362,9 +410,25 @@ struct ChargingStation: Codable, Equatable, Hashable, Identifiable, Sendable {
     }
 }
 
+enum StationLifecycle: String, Codable, Equatable, Hashable, Sendable {
+    case existing
+    case proposed
+    case unknown
+
+    var title: String {
+        switch self {
+        case .existing: "Existing site · planning record"
+        case .proposed: "Proposed site · not confirmed open"
+        case .unknown: "Site lifecycle unknown"
+        }
+    }
+}
+
 struct CatalogNetworkSummary: Equatable, Identifiable, Sendable {
     let network: String
     let sites: Int
+    let proposedSites: Int
+    let otherSites: Int
     let knownChargePoints: Int
     let sitesWithoutChargePointCount: Int
     let hasDirectoryRecords: Bool
@@ -383,12 +447,14 @@ enum CatalogCoverage {
         let summaries = grouped.map { network, records in
             let knownChargePoints = records.compactMap(\.chargePointCount).reduce(0, +)
             let missingPointCounts = records.filter { $0.chargePointCount == nil }.count
-            let hasDirectoryRecords = records.contains { $0.source == .openChargeMap }
+            let hasDirectoryRecords = records.contains { $0.source == .openChargeMap || $0.source == .mevnet }
             let hasPartnerFeed = records.contains { $0.source == .gentari }
             let hasOwnerProvidedRecords = records.contains { $0.source == .ownerProvided }
             return CatalogNetworkSummary(
                 network: network,
                 sites: records.count,
+                proposedSites: records.filter { $0.lifecycle == .proposed }.count,
+                otherSites: records.filter { $0.lifecycle != .proposed }.count,
                 knownChargePoints: knownChargePoints,
                 sitesWithoutChargePointCount: missingPointCounts,
                 hasDirectoryRecords: hasDirectoryRecords,
@@ -426,7 +492,7 @@ enum StationDiscovery {
         now: Date = .now
     ) -> [ChargingStation] {
         stations
-            .filter(profile.accepts)
+            .filter { $0.lifecycle != .proposed && profile.accepts($0) }
             .sorted { lhs, rhs in
                 let lhsRank = lhs.availability.isStale(at: now) ? AvailabilityState.unknown.sortRank : lhs.availability.state.sortRank
                 let rhsRank = rhs.availability.isStale(at: now) ? AvailabilityState.unknown.sortRank : rhs.availability.state.sortRank
@@ -449,6 +515,7 @@ enum StationDiscovery {
         chargingType: ChargingType? = nil,
         minimumListedPowerKW: Double? = nil,
         access: StationAccess? = nil,
+        includeProposed: Bool = false,
         now: Date = .now
     ) -> [ChargingStation] {
         let search = query.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -464,7 +531,7 @@ enum StationDiscovery {
                 station.connectors.contains { type == .ac ? $0.kind == .type2 : $0.kind == .ccs2 || $0.kind == .chademo }
             } ?? true
             let matchesPower = minimumListedPowerKW.map { (station.maximumPowerKW ?? 0) >= $0 } ?? true
-            return matchesSearch && matchesAvailability && matchesVehicle && matchesChargingType && matchesPower &&
+            return (includeProposed || station.lifecycle != .proposed) && matchesSearch && matchesAvailability && matchesVehicle && matchesChargingType && matchesPower &&
                 (network == nil || station.networkName == network) && (access == nil || (station.access ?? .unknown) == access)
         }
     }

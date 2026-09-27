@@ -25,6 +25,7 @@ test("Authenticated search serves cached open data when Gentari is unavailable",
     upstream.push(String(url));
     if (String(url).includes("/auth/v1/user")) return Response.json({ id: "user-1" });
     if (String(url).includes("/private_charger_sites")) return Response.json([]);
+    if (String(url).includes("source=eq.mevnet")) return Response.json([]);
     return Response.json([{
       stations: [{
         id: "ocm:42", name: "City Mall", address: "Kuala Lumpur", operatorName: "DC Handal",
@@ -42,10 +43,10 @@ test("Authenticated search serves cached open data when Gentari is unavailable",
     const data = await response.json();
     assert.equal(response.status, 200);
     assert.deepEqual(data.stations.map((station) => station.id), ["ocm:42"]);
-    assert.equal(data.warnings.length, 1);
+    assert.equal(data.warnings.length, 2);
     assert.equal(data.catalogImportReport, null);
     assert.deepEqual(data.duplicateIDs, []);
-    assert.equal(upstream.length, 3);
+    assert.equal(upstream.length, 4);
     assert.ok(upstream.every((url) => !url.includes("latitude") && !url.includes("longitude")));
   } finally {
     globalThis.fetch = originalFetch;

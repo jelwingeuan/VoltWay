@@ -1,4 +1,4 @@
-import { combineSources, filterStations, normalizeGentari, normalizePrivateSite, stationArray, type JSONObject, type Station } from "./shared.ts";
+import { combineNationwide, filterStations, normalizeGentari, normalizePrivateSite, stationArray, type JSONObject, type Station } from "./shared.ts";
 
 const jsonHeaders = { "Content-Type": "application/json" };
 
@@ -27,19 +27,25 @@ Deno.serve(async (request) => {
     return response({ error: "Invalid charger filters" }, 400);
   }
 
-  const [gentari, catalog, privateSites] = await Promise.all([
-    fetchGentari(), readCatalog(supabaseURL), readPrivateSites(supabaseURL, supabaseAnonKey, authorization),
+  const [gentari, catalog, mevnet, privateSites] = await Promise.all([
+    fetchGentari(), readCatalog(supabaseURL, "open_charge_map"), readCatalog(supabaseURL, "mevnet"),
+    readPrivateSites(supabaseURL, supabaseAnonKey, authorization),
   ]);
-  const combined = combineSources(gentari, catalog?.stations ?? null);
+  const combined = combineNationwide(gentari, catalog?.stations ?? null, mevnet?.stations ?? null);
   if (!combined && !privateSites?.stations.length) return response({ error: "Charger sources are unavailable" }, 502);
   const warnings = combined?.warnings ?? [];
+  if (!combined) warnings.push("Public charger sources unavailable; showing only privately shared sites.");
   if (privateSites === null) warnings.push("Private shared sites are temporarily unavailable.");
   if (catalog && Date.now() - new Date(catalog.syncedAt).getTime() > 48 * 60 * 60 * 1000) {
     warnings.push("Open Charge Map catalog has not synced recently; locations may be outdated.");
   }
+  if (mevnet && Date.now() - new Date(mevnet.syncedAt).getTime() > 35 * 24 * 60 * 60 * 1000) {
+    warnings.push("PLANMalaysia MEVnet catalog has not synced recently; planning locations may be outdated.");
+  }
   const stations = filterStations([...(combined?.stations ?? []), ...(privateSites?.stations ?? [])], new Set(requestedConnectors), minimumPower);
   return new Response(JSON.stringify({ stations, warnings, catalogSyncedAt: catalog?.syncedAt ?? null,
-    catalogImportReport: catalog?.importReport ?? null, duplicateCount: combined?.duplicateCount ?? 0,
+    catalogImportReport: catalog?.importReport ?? null, mevnetSyncedAt: mevnet?.syncedAt ?? null,
+    mevnetImportReport: mevnet?.importReport ?? null, duplicateCount: combined?.duplicateCount ?? 0,
     duplicateIDs: combined?.duplicateIDs ?? [], privateSiteCount: privateSites?.stations.length ?? 0 }), {
     status: 200,
     headers: { ...jsonHeaders, "Cache-Control": "private, max-age=30" },
@@ -85,12 +91,12 @@ async function fetchGentari(): Promise<Station[] | null> {
   }
 }
 
-async function readCatalog(supabaseURL: string): Promise<{ stations: Station[]; syncedAt: string; importReport: Record<string, unknown> | null } | null> {
+async function readCatalog(supabaseURL: string, source: "open_charge_map" | "mevnet"): Promise<{ stations: Station[]; syncedAt: string; importReport: Record<string, unknown> | null } | null> {
   const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
   if (!serviceKey) return null;
   try {
     const url = new URL(`${supabaseURL}/rest/v1/charger_catalog`);
-    url.searchParams.set("source", "eq.open_charge_map");
+    url.searchParams.set("source", `eq.${source}`);
     url.searchParams.set("select", "stations,synced_at,import_report");
     const catalogResponse = await fetch(url, {
       headers: { apikey: serviceKey, Authorization: `Bearer ${serviceKey}` },

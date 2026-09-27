@@ -8,6 +8,8 @@ import {
   normalizeOpenChargeMap,
   normalizePrivateSite,
   classifyOpenChargeMap,
+  normalizeMEVnet,
+  combineNationwide,
 } from "./shared.ts";
 
 const ocm = (overrides = {}) => ({
@@ -29,6 +31,70 @@ const ocm = (overrides = {}) => ({
   StatusType: { IsOperational: true },
   UsageCost: "RM 1.40/kWh",
   ...overrides,
+});
+
+test("MEVnet keeps AC/DC counts separate from verified connectors and rejects invalid coordinates", () => {
+  const station = normalizeMEVnet({ objectid: 4, location: "City Mall", latitude: 3.14, longitude: 101.68,
+    state: "Selangor", status: "Existing", type_ac: 2, type_dc: 1, number_of_existing_ev_charger_s: 3,
+    number_of_ev_charger_by_netw_10: 3, data_as: "31-Aug-24", bil: 4, state_code: 10,
+    pbt_code: 17, indoor___outdoor: "Indoor" });
+  assert.equal(station.id, "mevnet:4");
+  assert.deepEqual(station.connectors, []);
+  assert.equal(station.operatorName, "Gentari");
+  assert.equal(station.chargePointCount, 3);
+  assert.equal(station.sourceUpdatedAt, "2024-08-31T00:00:00.000Z");
+  assert.equal(station.sourceSequence, 4);
+  assert.equal(station.stateCode, 10);
+  assert.equal(station.pbtCode, 17);
+  assert.equal(station.indoorOutdoor, "Indoor");
+  assert.deepEqual(filterStations([station], new Set(["ccs2"]), 0), []);
+  assert.equal(normalizeMEVnet({ objectid: 5, location: "Outside", latitude: 20, longitude: 101 }), null);
+  const fields = { number_of_ev_charger_by_network: 1 };
+  for (let index = 1; index <= 26; index++) {
+    fields[index < 10 ? `number_of_ev_charger_by_netwo_${index}` : `number_of_ev_charger_by_netw_${index}`] = 1;
+  }
+  const allNetworks = normalizeMEVnet({ objectid: 6, location: "Network counts", latitude: 3.14, longitude: 101.68, ...fields });
+  assert.equal(Object.keys(allNetworks.networkCounts).length, 27);
+});
+
+test("nationwide merge keeps Gentari ID and status, OCM connectors, and MEVnet lifecycle", () => {
+  const partner = normalizeGentari({ id: "favorite-id", name: "City Mall", latitude: 3.14, longitude: 101.68,
+    connectors: [{ kind: "CCS2", powerKW: 120 }], availability: { status: "available" } });
+  const directory = normalizeOpenChargeMap(ocm());
+  const planning = normalizeMEVnet({ objectid: 4, location: "City Mall", latitude: 3.14, longitude: 101.68,
+    status: "Existing", type_ac: 2, type_dc: 1, bil: 4, state_code: 10, pbt_code: 17,
+    indoor___outdoor: "Indoor" });
+  const merged = combineNationwide([partner], [directory], [planning]);
+  assert.equal(merged.stations.length, 1);
+  assert.equal(merged.stations[0].id, "favorite-id");
+  assert.equal(merged.stations[0].availability.state, "available");
+  assert.equal(merged.stations[0].lifecycle, "existing");
+  assert.equal(merged.stations[0].sourceIDs.mevnet, "4");
+  assert.equal(merged.stations[0].sourceSequence, 4);
+  assert.equal(merged.stations[0].stateCode, 10);
+  assert.equal(merged.stations[0].pbtCode, 17);
+  assert.equal(merged.stations[0].indoorOutdoor, "Indoor");
+  assert.equal(merged.duplicateCount, 2);
+  const nearbyDistinct = normalizeMEVnet({ objectid: 5, location: "Another Hub", latitude: 3.14, longitude: 101.68 });
+  assert.equal(combineNationwide([partner], null, [nearbyDistinct]).stations.length, 2);
+  const secondPartnerHub = normalizeGentari({ id: "second-hub", name: "City Mall", latitude: 3.14, longitude: 101.68,
+    connectors: [{ kind: "CCS2", powerKW: 120 }] });
+  assert.equal(combineNationwide([partner, secondPartnerHub], null, null).stations.length, 2);
+  assert.equal(combineNationwide([partner, secondPartnerHub], [directory], null).stations.length, 3);
+  const namedVariant = normalizeMEVnet({ objectid: 6, location: "City Mall EV Charging", latitude: 3.14, longitude: 101.68 });
+  assert.equal(combineNationwide([partner], null, [namedVariant]).stations.length, 1);
+});
+
+test("a proposed planning row cannot hide a live charger at the same named site", () => {
+  const partner = normalizeGentari({ id: "live-site", name: "City Mall", latitude: 3.14, longitude: 101.68,
+    connectors: [{ kind: "CCS2", powerKW: 120 }], availability: { status: "available", last_updated: "2026-09-28T00:00:00Z" } });
+  const planned = normalizeMEVnet({ objectid: 7, location: "City Mall", latitude: 3.14, longitude: 101.68,
+    status: "Newly Proposed" });
+  const result = combineNationwide([partner], null, [planned]);
+  assert.deepEqual(result.stations.map((station) => station.id), ["live-site", "mevnet:7"]);
+  assert.equal(result.stations[0].lifecycle, undefined);
+  assert.equal(result.stations[0].availability.state, "available");
+  assert.equal(result.stations[1].availability.state, "unknown");
 });
 
 test("OCM imports contributor locations but never directory status or price", () => {

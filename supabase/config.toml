@@ -3,3 +3,6 @@ verify_jwt = true
 
 [functions.sync-ocm]
 verify_jwt = false
+
+[functions.sync-mevnet]
+verify_jwt = false

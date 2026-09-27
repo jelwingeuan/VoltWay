@@ -110,6 +110,7 @@ final class CarPlaySceneDelegate: NSObject, CPTemplateApplicationSceneDelegate {
             CPInformationItem(title: "Price updated", detail: updateText(station.price?.lastUpdated)),
             CPInformationItem(title: "Connectors", detail: station.connectorSummary),
             CPInformationItem(title: "Access", detail: station.access?.title ?? "Requirements unknown"),
+            CPInformationItem(title: "Site", detail: station.lifecycle?.title ?? "Lifecycle unverified"),
             CPInformationItem(title: "Data source", detail: station.attributionText ?? "Unavailable"),
             CPInformationItem(title: "Address", detail: station.address)
         ]

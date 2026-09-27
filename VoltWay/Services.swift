@@ -40,15 +40,20 @@ struct StationFetchResult: Decodable, Sendable {
     let warnings: [String]?
     let catalogSyncedAt: Date?
     let catalogImportReport: CatalogImportReport?
+    let mevnetSyncedAt: Date?
+    let mevnetImportReport: MEVnetImportReport?
     let duplicateCount: Int?
     let privateSiteCount: Int?
 
     init(stations: [ChargingStation], warnings: [String]? = nil, catalogSyncedAt: Date? = nil,
-         catalogImportReport: CatalogImportReport? = nil, duplicateCount: Int? = nil, privateSiteCount: Int? = nil) {
+         catalogImportReport: CatalogImportReport? = nil, mevnetSyncedAt: Date? = nil,
+         mevnetImportReport: MEVnetImportReport? = nil, duplicateCount: Int? = nil, privateSiteCount: Int? = nil) {
         self.stations = stations
         self.warnings = warnings
         self.catalogSyncedAt = catalogSyncedAt
         self.catalogImportReport = catalogImportReport
+        self.mevnetSyncedAt = mevnetSyncedAt
+        self.mevnetImportReport = mevnetImportReport
         self.duplicateCount = duplicateCount
         self.privateSiteCount = privateSiteCount
     }

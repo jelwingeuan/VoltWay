@@ -199,6 +199,7 @@ struct DiscoverView: View {
     @State private var searchText = ""
     @State private var availableNowOnly = false
     @State private var showAllSites = false
+    @State private var includeProposed = false
     @State private var chargingType: ChargingType?
     @State private var minimumListedPowerKW: Double?
     @State private var accessFilter: StationAccess?
@@ -211,7 +212,7 @@ struct DiscoverView: View {
 
     private var visibleStations: [ChargingStation] {
         StationDiscovery.visibleStations(
-            from: showAllSites ? store.stations : store.compatibleStations,
+            from: showAllSites || includeProposed ? store.stations : store.compatibleStations,
             query: searchText,
             availableNowOnly: availableNowOnly,
             network: selectedNetwork,
@@ -220,12 +221,13 @@ struct DiscoverView: View {
             chargingType: chargingType,
             minimumListedPowerKW: minimumListedPowerKW,
             access: accessFilter,
+            includeProposed: includeProposed,
             now: freshnessTime
         )
     }
 
     private var networks: [String] {
-        StationDiscovery.networks(from: showAllSites ? store.stations : store.compatibleStations)
+        StationDiscovery.networks(from: showAllSites || includeProposed ? store.stations : store.compatibleStations)
     }
 
     private var selectedStation: ChargingStation? {
@@ -246,7 +248,7 @@ struct DiscoverView: View {
     private var compactStationPreviewDetent: PresentationDetent { .height(340) }
 
     private var activeFilterCount: Int {
-        [chargingType != nil, minimumListedPowerKW != nil, accessFilter != nil]
+        [chargingType != nil, minimumListedPowerKW != nil, accessFilter != nil, includeProposed]
             .filter { $0 }
             .count
     }
@@ -362,6 +364,10 @@ struct DiscoverView: View {
         NavigationStack {
             Form {
                 Section("Charger") {
+                    Toggle("Show proposed sites in All sites", isOn: $includeProposed)
+                    Text("Switch to All sites to see proposed MEVnet planning records. They are not confirmed open chargers.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                     Picker("Charging type", selection: $chargingType) {
                         Text("AC and DC").tag(ChargingType?.none)
                         ForEach(ChargingType.allCases) { type in Text(type.rawValue).tag(Optional(type)) }
@@ -397,6 +403,7 @@ struct DiscoverView: View {
                             chargingType = nil
                             minimumListedPowerKW = nil
                             accessFilter = nil
+                            includeProposed = false
                         }
                     }
                 }
@@ -464,6 +471,11 @@ struct DiscoverView: View {
         }
         if let catalogSyncedAt = store.catalogSyncedAt {
             Label("Open Charge Map directory synced \(catalogSyncedAt.formatted(.relative(presentation: .named))) · not live status", systemImage: "books.vertical")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        if let mevnetSyncedAt = store.mevnetSyncedAt {
+            Label("MEVnet planning catalog synced \(mevnetSyncedAt.formatted(.relative(presentation: .named))) · not live status", systemImage: "map")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -671,6 +683,7 @@ struct DiscoverView: View {
                     chargingType = nil
                     minimumListedPowerKW = nil
                     accessFilter = nil
+                    includeProposed = false
                 }
             )
         }
@@ -752,12 +765,14 @@ private struct ChargerMapView: UIViewRepresentable {
         let title: String?
         let coordinate: CLLocationCoordinate2D
         var isAvailable: Bool
+        let isProposed: Bool
 
         init(station: ChargingStation, isAvailable: Bool) {
             stationID = station.id
             title = station.networkName
             coordinate = station.coordinate.coreLocation.coordinate
             self.isAvailable = isAvailable
+            isProposed = station.lifecycle == .proposed
         }
     }
 
@@ -778,8 +793,8 @@ private struct ChargerMapView: UIViewRepresentable {
             guard let charger = annotation as? ChargerAnnotation else { return nil }
             let view = mapView.dequeueReusableAnnotationView(withIdentifier: "charger", for: charger) as! MKMarkerAnnotationView
             view.clusteringIdentifier = "chargers"
-            view.markerTintColor = charger.isAvailable ? UIColor(Color.voltMint) : UIColor(Color.voltBlue)
-            view.glyphImage = UIImage(systemName: "bolt.car.fill")
+            view.markerTintColor = charger.isProposed ? .systemGray : charger.isAvailable ? UIColor(Color.voltMint) : UIColor(Color.voltBlue)
+            view.glyphImage = UIImage(systemName: charger.isProposed ? "clock" : "bolt.car.fill")
             return view
         }
 
@@ -820,6 +835,9 @@ private struct StationMapPreview: View {
                         .lineLimit(1)
                 }
                 if store.isDemoMode { DemoNotice() }
+                if let lifecycle = station.lifecycle {
+                    Text(lifecycle.title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                }
             }
 
             VoltSurface {
@@ -840,6 +858,9 @@ private struct StationMapPreview: View {
                         Divider()
                         VStack(alignment: .leading, spacing: 5) {
                             Text(station.access?.title ?? "Access requirements unknown")
+                            if let ac = station.acCount, let dc = station.dcCount {
+                                Text("MEVnet lists \(ac) AC · \(dc) DC; plug standards unverified")
+                            }
                             if station.connectors.isEmpty {
                                 Text("Compatibility unknown · connector details unavailable")
                                     .fontWeight(.semibold)
@@ -850,15 +871,13 @@ private struct StationMapPreview: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         if let attribution = station.attributionText {
-                            if let sourceURL = station.sourceURL {
-                                Link("Data: \(attribution)", destination: sourceURL).font(.caption)
-                            } else {
-                                Text("Data: \(attribution)").font(.caption).foregroundStyle(.secondary)
-                            }
+                            Text("Data: \(attribution)").font(.caption).foregroundStyle(.secondary)
+                            if let sourceURL = station.sourceURL { Link("Open Charge Map record", destination: sourceURL).font(.caption) }
                         }
                         VStack(alignment: .leading, spacing: 2) {
                             Text(updateText("Status", at: station.availability.lastUpdated))
                             Text(updateText("Price", at: station.price?.lastUpdated))
+                            if let updated = station.sourceUpdatedAt { Text(updateText("Source", at: updated)) }
                         }
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -948,6 +967,9 @@ struct StationRow: View {
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
+                if let lifecycle = station.lifecycle {
+                    Text(lifecycle.title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                }
                 if let attribution = station.attributionText {
                     Text(attribution).font(.caption).foregroundStyle(.secondary)
                 }
@@ -1067,15 +1089,24 @@ struct StationDetailView: View {
                     .font(.body)
                     .foregroundStyle(.secondary)
                 if store.isDemoMode { DemoNotice() }
+                if let lifecycle = station.lifecycle {
+                    Text(lifecycle.title).font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
+                }
+                if let ac = station.acCount, let dc = station.dcCount {
+                    Text("MEVnet lists \(ac) AC · \(dc) DC; plug standards unverified")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                if let proposedCount = station.proposedChargePointCount, proposedCount > 0 {
+                    Text("\(proposedCount) proposed charge points · not confirmed installed")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                if let updated = station.sourceUpdatedAt {
+                    LabeledContent("Planning data as of", value: updated.formatted(date: .abbreviated, time: .omitted))
+                        .font(.caption)
+                }
                 if let attribution = station.attributionText {
-                    if let sourceURL = station.sourceURL {
-                        Link("Data: \(attribution)", destination: sourceURL)
-                            .font(.caption)
-                    } else {
-                        Text("Data: \(attribution)")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
+                    Text("Data: \(attribution)").font(.caption).foregroundStyle(.secondary)
+                    if let sourceURL = station.sourceURL { Link("Open Charge Map record", destination: sourceURL).font(.caption) }
                 }
                 Text(station.access?.title ?? "Access requirements unknown")
                     .font(.subheadline)
@@ -1719,9 +1750,29 @@ struct ProfileView: View {
             }
 
             Section("Catalog coverage") {
+                if let report = store.mevnetImportReport {
+                    if let synced = store.mevnetSyncedAt {
+                        LabeledContent("MEVnet last import", value: synced.formatted(date: .abbreviated, time: .shortened))
+                    }
+                    LabeledContent("MEVnet records fetched", value: report.fetched.formatted())
+                    LabeledContent("Existing sites included", value: report.existing.formatted())
+                    LabeledContent("Proposed sites (hidden by default)", value: report.proposed.formatted())
+                    LabeledContent("Invalid records excluded", value: report.invalid.formatted())
+                    LabeledContent("Private records excluded", value: (report.private ?? 0).formatted())
+                    LabeledContent("Access not verified", value: (report.accessUnverified ?? 0).formatted())
+                    ForEach(report.states.keys.sorted(), id: \.self) { state in
+                        if let tally = report.states[state] {
+                            LabeledContent(state, value: "\(tally.included) sites · \(tally.proposed) proposed")
+                        }
+                    }
+                }
                 ForEach(CatalogCoverage.networks(in: store.stations)) { summary in
                     let source = summary.hasPartnerFeed ? "partner feed" : summary.hasDirectoryRecords ? "directory" : "owner shared"
                     LabeledContent("\(summary.network) · \(source)", value: "\(summary.sites) sites")
+                    if summary.proposedSites > 0 {
+                        LabeledContent("  Proposed · not confirmed open", value: summary.proposedSites.formatted())
+                        LabeledContent("  Not marked proposed", value: summary.otherSites.formatted())
+                    }
                     if summary.knownChargePoints > 0 {
                         LabeledContent("  Listed charge points", value: summary.knownChargePoints.formatted())
                     }

@@ -14,9 +14,26 @@ export type Station = {
     lastUpdated: string | null;
   };
   price: { amountMYR: number; unit: string; lastUpdated: string | null } | null;
-  source: "gentari" | "openChargeMap" | "ownerProvided";
+  source: "gentari" | "openChargeMap" | "ownerProvided" | "mevnet";
   sourceAttribution?: string;
-  access?: "public" | "limited" | "unknown";
+  sourceAttributions?: string[];
+  sourceIDs?: Record<string, string>;
+  sourceUpdatedAt?: string | null;
+  state?: string | null;
+  sourceSequence?: number | null;
+  stateCode?: number | null;
+  pbtCode?: number | null;
+  pbt?: string | null;
+  indoorOutdoor?: string | null;
+  lifecycle?: "existing" | "proposed" | "unknown";
+  acCount?: number | null;
+  dcCount?: number | null;
+  proposedChargePointCount?: number | null;
+  indoorCount?: number | null;
+  outdoorCount?: number | null;
+  category?: string | null;
+  networkCounts?: Record<string, number>;
+  access?: "public" | "limited" | "unknown" | "private";
   chargePointCount?: number | null;
 };
 
@@ -84,12 +101,66 @@ export function normalizeGentari(raw: JSONObject): Station | null {
       lastUpdated: isoDate(pricePayload?.last_updated ?? pricePayload?.updated_at),
     } : null,
     source: "gentari",
+    sourceAttribution: "Gentari partner feed",
+    sourceAttributions: ["Gentari partner feed"],
+    sourceIDs: { gentari: id },
     chargePointCount: positiveInteger(raw.number_of_points ?? raw.charge_point_count),
   };
 }
 
 export function normalizeOpenChargeMap(raw: JSONObject): Station | null {
   return classifyOpenChargeMap(raw).station;
+}
+
+const mevnetNetworks = ["1Utama", "ABB", "BMW", "Charge N Go", "chargEV", "ChargeSini", "ETCM", "Evwave", "Exicom", "Flexi Parking", "Gentari", "GoCar", "Go To-U", "JomCharge", "Kineta", "MINI", "Nichicon", "ParkEasy", "PEKEMA", "Pestech", "Plugit", "Schneider", "Shell Recharge", "Sunway", "TNB Electron", "Zap", "Others"];
+
+export function normalizeMEVnet(raw: JSONObject): Station | null {
+  const id = positiveInteger(raw.objectid);
+  const latitude = number(raw.latitude);
+  const longitude = number(raw.longitude);
+  const name = text(raw.location);
+  if (!id || !name || name.length > 160 || !validCoordinate(latitude, longitude) || latitude < 0.8 || latitude > 7.5 || longitude! < 99 || longitude! > 120.5) return null;
+  const networkCounts: Record<string, number> = {};
+  mevnetNetworks.forEach((network, index) => {
+    const key = index === 0 ? "number_of_ev_charger_by_network" : `number_of_ev_charger_by_netwo_${index}`;
+    const actualKey = index >= 10 ? `number_of_ev_charger_by_netw_${index}` : key;
+    const count = nonnegativeInteger(raw[actualKey]);
+    if (count !== null) networkCounts[network] = count;
+  });
+  const activeNetworks = Object.entries(networkCounts).filter(([network, count]) => count > 0 && network !== "Others").map(([network]) => network);
+  const status = text(raw.status)?.toLowerCase() ?? "";
+  const lifecycle = status.includes("propos") ? "proposed" : status.includes("exist") ? "existing" : "unknown";
+  const sourceUpdatedAt = mevnetDate(raw.data_as);
+  return {
+    id: `mevnet:${id}`, name,
+    address: [text(raw.pbt)?.slice(0, 100), text(raw.state)?.slice(0, 100)].filter(Boolean).join(", ") || "Address unavailable",
+    coordinate: { latitude, longitude: longitude! },
+    operatorName: activeNetworks.length === 1 ? activeNetworks[0] : activeNetworks.length > 1 ? "Multiple networks" : "Network unavailable",
+    connectors: [],
+    availability: { state: "unknown", availableConnectors: null, totalConnectors: null, lastUpdated: null },
+    price: null, source: "mevnet", sourceAttribution: "PLANMalaysia MEVnet · planning catalog",
+    sourceAttributions: ["PLANMalaysia MEVnet · planning catalog"], sourceIDs: { mevnet: String(id) }, sourceUpdatedAt,
+    state: text(raw.state)?.slice(0, 100) ?? null,
+    sourceSequence: positiveInteger(raw.bil), stateCode: nonnegativeInteger(raw.state_code),
+    pbtCode: nonnegativeInteger(raw.pbt_code), pbt: text(raw.pbt)?.slice(0, 100) ?? null,
+    indoorOutdoor: text(raw.indoor___outdoor)?.slice(0, 100) ?? null, lifecycle,
+    acCount: nonnegativeInteger(raw.type_ac), dcCount: nonnegativeInteger(raw.type_dc),
+    proposedChargePointCount: nonnegativeInteger(raw.number_of_proposed_ev_charger__),
+    indoorCount: nonnegativeInteger(raw.indoor), outdoorCount: nonnegativeInteger(raw.outdoor),
+    category: text(raw.category),
+    chargePointCount: nonnegativeInteger(raw.number_of_existing_ev_charger_s), networkCounts,
+    access: "unknown",
+  };
+}
+
+export function isPrivateMEVnet(raw: JSONObject): boolean {
+  return [raw.category, raw.access, raw.usage_type].some((value) =>
+    typeof value === "string" && /\bprivate\b|\bstaff.only\b|\brestricted\b/i.test(value));
+}
+
+export function isAccessUnverifiedMEVnet(raw: JSONObject): boolean {
+  const category = text(raw.category)?.toLowerCase();
+  return category !== null && ["residential", "residences", "strata", "office", "university"].includes(category);
 }
 
 export function normalizePrivateSite(raw: JSONObject): Station | null {
@@ -189,6 +260,8 @@ export function classifyOpenChargeMap(raw: JSONObject): {
     price: null,
     source: "openChargeMap",
     sourceAttribution: attribution,
+    sourceAttributions: [attribution],
+    sourceIDs: { openChargeMap: `ocm:${id}` },
     access,
     chargePointCount: positiveInteger(raw.NumberOfPoints),
   }, excluded: null, providerID };
@@ -224,6 +297,77 @@ export function combineSources(gentari: Station[] | null, openChargeMap: Station
   if (openChargeMap === null) warnings.push("Open Charge Map catalog unavailable; showing Gentari locations only.");
   const { stations, duplicateIDs } = mergeWithDuplicateIDs(gentari ?? [], openChargeMap ?? []);
   return { stations, warnings, duplicateCount: duplicateIDs.length, duplicateIDs };
+}
+
+export function combineNationwide(gentari: Station[] | null, openChargeMap: Station[] | null, mevnet: Station[] | null): {
+  stations: Station[]; warnings: string[]; duplicateCount: number; duplicateIDs: string[];
+} | null {
+  if (gentari === null && openChargeMap === null && mevnet === null) return null;
+  const warnings: string[] = [];
+  if (gentari === null) warnings.push("Gentari live feed unavailable; partner status and pricing may be absent.");
+  if (openChargeMap === null) warnings.push("Open Charge Map directory unavailable; connector and access details may be absent.");
+  if (mevnet === null) warnings.push("PLANMalaysia MEVnet baseline unavailable; nationwide catalog coverage is partial.");
+  const stations: Station[] = [];
+  const duplicateIDs: string[] = [];
+  const byName = new Map<string, number[]>();
+  const bySourceID = new Map<string, number>();
+  for (const incoming of [...(gentari ?? []), ...(openChargeMap ?? []), ...(mevnet ?? [])]) {
+    const ids = incoming.sourceIDs ?? { [incoming.source]: incoming.id };
+    const sharedIndex = Object.entries(ids).map(([source, id]) => bySourceID.get(`${source}:${id}`)).find((index) => index !== undefined);
+    const nameMatches = (byName.get(siteName(incoming.name)) ?? []).filter((candidate) => sameSite(stations[candidate], incoming));
+    // Ambiguous co-located hubs stay separate unless an exact cross-source ID resolves them.
+    const index = sharedIndex ?? (nameMatches.length === 1 ? nameMatches[0] : -1);
+    if (index < 0) {
+      const nextIndex = stations.length;
+      stations.push(incoming);
+      byName.set(siteName(incoming.name), [...(byName.get(siteName(incoming.name)) ?? []), nextIndex]);
+      Object.entries(ids).forEach(([source, id]) => bySourceID.set(`${source}:${id}`, nextIndex));
+      continue;
+    }
+    const existing = stations[index];
+    duplicateIDs.push(incoming.id);
+    const sourceIDs = { ...(existing.sourceIDs ?? { [existing.source]: existing.id }), ...(incoming.sourceIDs ?? { [incoming.source]: incoming.id }) };
+    const sourceAttributions = [...new Set([...(existing.sourceAttributions ?? [existing.sourceAttribution ?? existing.source]),
+      ...(incoming.sourceAttributions ?? [incoming.sourceAttribution ?? incoming.source])])];
+    // Source order is Gentari, OCM, MEVnet. Preserve the first stable ID and all trusted enriched facts.
+    stations[index] = { ...existing, sourceIDs, sourceAttributions,
+      sourceAttribution: sourceAttributions.join(" · "),
+      connectors: existing.connectors.length ? existing.connectors : incoming.connectors,
+      address: existing.address !== "Address unavailable" ? existing.address : incoming.address,
+      state: incoming.source === "mevnet" ? incoming.state : existing.state,
+      sourceSequence: incoming.source === "mevnet" ? incoming.sourceSequence : existing.sourceSequence,
+      stateCode: incoming.source === "mevnet" ? incoming.stateCode : existing.stateCode,
+      pbtCode: incoming.source === "mevnet" ? incoming.pbtCode : existing.pbtCode,
+      pbt: incoming.source === "mevnet" ? incoming.pbt : existing.pbt,
+      indoorOutdoor: incoming.source === "mevnet" ? incoming.indoorOutdoor : existing.indoorOutdoor,
+      lifecycle: incoming.source === "mevnet" ? incoming.lifecycle : existing.lifecycle,
+      acCount: incoming.source === "mevnet" ? incoming.acCount : existing.acCount,
+      dcCount: incoming.source === "mevnet" ? incoming.dcCount : existing.dcCount,
+      proposedChargePointCount: incoming.source === "mevnet" ? incoming.proposedChargePointCount : existing.proposedChargePointCount,
+      indoorCount: incoming.source === "mevnet" ? incoming.indoorCount : existing.indoorCount,
+      outdoorCount: incoming.source === "mevnet" ? incoming.outdoorCount : existing.outdoorCount,
+      category: incoming.source === "mevnet" ? incoming.category : existing.category,
+      networkCounts: incoming.source === "mevnet" ? incoming.networkCounts : existing.networkCounts,
+      chargePointCount: incoming.source === "mevnet" && incoming.chargePointCount !== null ? incoming.chargePointCount : existing.chargePointCount,
+      sourceUpdatedAt: incoming.source === "mevnet" ? incoming.sourceUpdatedAt : existing.sourceUpdatedAt,
+      access: existing.access === "unknown" ? incoming.access : existing.access,
+    };
+    if (!(byName.get(siteName(incoming.name)) ?? []).includes(index)) {
+      byName.set(siteName(incoming.name), [...(byName.get(siteName(incoming.name)) ?? []), index]);
+    }
+    Object.entries(sourceIDs).forEach(([source, id]) => bySourceID.set(`${source}:${id}`, index));
+  }
+  return { stations, warnings, duplicateCount: duplicateIDs.length, duplicateIDs };
+}
+
+function sameSite(lhs: Station, rhs: Station): boolean {
+  if (lhs.id === rhs.id) return true;
+  if (Object.entries(lhs.sourceIDs ?? {}).some(([source, id]) => rhs.sourceIDs?.[source] === id)) return true;
+  if (lhs.lifecycle === "proposed" || rhs.lifecycle === "proposed") return false;
+  if (lhs.source === rhs.source) return false;
+  if (distanceMeters(lhs.coordinate, rhs.coordinate) > 120) return false;
+  // Equal site names are required when no shared source ID exists: nearby mall hubs can be distinct.
+  return sameName(lhs.name, rhs.name);
 }
 
 export function filterStations(stations: Station[], connectors: Set<string>, minimumPower: number): Station[] {
@@ -266,9 +410,26 @@ function normalizePriceUnit(value: string | null): string | null {
 }
 
 function sameName(lhs: string, rhs: string): boolean {
-  const normalized = (value: string) => value.toLowerCase().replaceAll(/[^a-z0-9]/g, "");
-  const first = normalized(lhs);
-  return first.length > 0 && first === normalized(rhs);
+  const first = siteName(lhs);
+  return first.length > 0 && first === siteName(rhs);
+}
+
+function siteName(value: string): string {
+  const tokens = value.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  const meaningful = tokens.filter((token) => !["ev", "charging", "charger", "chargers", "station", "site", "evcb"].includes(token));
+  return (meaningful.length ? meaningful : tokens).join("");
+}
+
+function mevnetDate(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const match = /^(\d{1,2})-([A-Za-z]{3})-(\d{2}|\d{4})$/.exec(value);
+  if (!match) return null;
+  const months = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+  const month = months.indexOf(match[2].toLowerCase());
+  const year = match[3].length === 2 ? 2000 + Number(match[3]) : Number(match[3]);
+  if (month < 0 || year < 2000) return null;
+  const date = new Date(Date.UTC(year, month, Number(match[1])));
+  return date.getUTCMonth() === month && date.getUTCDate() === Number(match[1]) ? date.toISOString() : null;
 }
 
 function distanceMeters(lhs: Station["coordinate"], rhs: Station["coordinate"]): number {
