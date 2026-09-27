@@ -1,4 +1,4 @@
-import { combineSources, filterStations, normalizeGentari, stationArray, type Station } from "./shared.ts";
+import { combineSources, filterStations, normalizeGentari, normalizePrivateSite, stationArray, type JSONObject, type Station } from "./shared.ts";
 
 const jsonHeaders = { "Content-Type": "application/json" };
 
@@ -27,19 +27,45 @@ Deno.serve(async (request) => {
     return response({ error: "Invalid charger filters" }, 400);
   }
 
-  const [gentari, catalog] = await Promise.all([fetchGentari(), readCatalog(supabaseURL)]);
+  const [gentari, catalog, privateSites] = await Promise.all([
+    fetchGentari(), readCatalog(supabaseURL), readPrivateSites(supabaseURL, supabaseAnonKey, authorization),
+  ]);
   const combined = combineSources(gentari, catalog?.stations ?? null);
-  if (!combined) return response({ error: "Charger sources are unavailable" }, 502);
-  const warnings = combined.warnings;
+  if (!combined && !privateSites?.stations.length) return response({ error: "Charger sources are unavailable" }, 502);
+  const warnings = combined?.warnings ?? [];
+  if (privateSites === null) warnings.push("Private shared sites are temporarily unavailable.");
   if (catalog && Date.now() - new Date(catalog.syncedAt).getTime() > 48 * 60 * 60 * 1000) {
     warnings.push("Open Charge Map catalog has not synced recently; locations may be outdated.");
   }
-  const stations = filterStations(combined.stations, new Set(requestedConnectors), minimumPower);
-  return new Response(JSON.stringify({ stations, warnings, catalogSyncedAt: catalog?.syncedAt ?? null }), {
+  const stations = filterStations([...(combined?.stations ?? []), ...(privateSites?.stations ?? [])], new Set(requestedConnectors), minimumPower);
+  return new Response(JSON.stringify({ stations, warnings, catalogSyncedAt: catalog?.syncedAt ?? null,
+    catalogImportReport: catalog?.importReport ?? null, duplicateCount: combined?.duplicateCount ?? 0,
+    duplicateIDs: combined?.duplicateIDs ?? [], privateSiteCount: privateSites?.stations.length ?? 0 }), {
     status: 200,
     headers: { ...jsonHeaders, "Cache-Control": "private, max-age=30" },
   });
 });
+
+async function readPrivateSites(supabaseURL: string, anonKey: string, authorization: string): Promise<{ stations: Station[] } | null> {
+  try {
+    const url = new URL(`${supabaseURL}/rest/v1/private_charger_sites`);
+    url.searchParams.set("select", "id,station");
+    const result = await fetch(url, {
+      headers: { apikey: anonKey, Authorization: authorization },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!result.ok) return null;
+    const rows: unknown = await result.json();
+    if (!Array.isArray(rows)) return null;
+    return { stations: rows.filter(isObject).map(normalizePrivateSite).filter((station): station is Station => station !== null) };
+  } catch {
+    return null;
+  }
+}
+
+function isObject(value: unknown): value is JSONObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
 
 async function fetchGentari(): Promise<Station[] | null> {
   const partnerURL = Deno.env.get("GENTARI_API_URL");
@@ -59,13 +85,13 @@ async function fetchGentari(): Promise<Station[] | null> {
   }
 }
 
-async function readCatalog(supabaseURL: string): Promise<{ stations: Station[]; syncedAt: string } | null> {
+async function readCatalog(supabaseURL: string): Promise<{ stations: Station[]; syncedAt: string; importReport: Record<string, unknown> | null } | null> {
   const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
   if (!serviceKey) return null;
   try {
     const url = new URL(`${supabaseURL}/rest/v1/charger_catalog`);
     url.searchParams.set("source", "eq.open_charge_map");
-    url.searchParams.set("select", "stations,synced_at");
+    url.searchParams.set("select", "stations,synced_at,import_report");
     const catalogResponse = await fetch(url, {
       headers: { apikey: serviceKey, Authorization: `Bearer ${serviceKey}` },
       signal: AbortSignal.timeout(10_000),
@@ -74,7 +100,9 @@ async function readCatalog(supabaseURL: string): Promise<{ stations: Station[]; 
     const rows = await catalogResponse.json();
     const row = Array.isArray(rows) ? rows[0] : null;
     if (!row || !Array.isArray(row.stations) || !row.stations.length || typeof row.synced_at !== "string") return null;
-    return { stations: row.stations, syncedAt: row.synced_at };
+    const report = row.import_report;
+    return { stations: row.stations, syncedAt: row.synced_at,
+      importReport: report && typeof report.fetched === "number" ? report : null };
   } catch {
     return null;
   }

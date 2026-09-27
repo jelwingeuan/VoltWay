@@ -29,7 +29,44 @@ struct VoltSurface<Content: View>: View {
     var body: some View {
         content
             .padding(18)
-            .background(Color.voltSurface, in: .rect(cornerRadius: 18))
+            .background(Color.voltSurface, in: .rect(cornerRadius: 22, style: .continuous))
+    }
+}
+
+struct VoltGlassPanel<Content: View>: View {
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
+
+    let content: Content
+    let cornerRadius: CGFloat
+
+    init(cornerRadius: CGFloat = 28, @ViewBuilder content: () -> Content) {
+        self.cornerRadius = cornerRadius
+        self.content = content()
+    }
+
+    private var shape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+    }
+
+    private var usesOpaqueSurface: Bool {
+        reduceTransparency || colorSchemeContrast == .increased
+    }
+
+    var body: some View {
+        content
+            .padding(18)
+            .background {
+                if usesOpaqueSurface {
+                    shape.fill(Color.voltSurface)
+                } else {
+                    shape.fill(Color.clear)
+                        .glassEffect(.regular, in: shape)
+                }
+            }
+            .overlay {
+                shape.strokeBorder(Color.primary.opacity(usesOpaqueSurface ? 0.16 : 0.08), lineWidth: 1)
+            }
     }
 }
 

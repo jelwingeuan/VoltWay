@@ -25,15 +25,27 @@ enum ConnectorKind: String, Codable, CaseIterable, Hashable, Identifiable, Senda
     }
 }
 
-struct VehicleProfile: Codable, Equatable, Sendable {
+struct VehicleProfile: Codable, Equatable, Identifiable, Sendable {
+    var id: UUID
     var userID: String?
+    var name: String
     var connectors: [ConnectorKind]
     var minimumPowerKW: Double?
     var updatedAt: Date?
 
-    static let demo = VehicleProfile(connectors: [.type2, .ccs2], minimumPowerKW: nil)
+    static let demo = VehicleProfile(id: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!, name: "Demo EV", connectors: [.type2, .ccs2], minimumPowerKW: nil)
+
+    init(id: UUID = UUID(), userID: String? = nil, name: String = "My EV", connectors: [ConnectorKind], minimumPowerKW: Double?, updatedAt: Date? = nil) {
+        self.id = id
+        self.userID = userID
+        self.name = name
+        self.connectors = connectors
+        self.minimumPowerKW = minimumPowerKW
+        self.updatedAt = updatedAt
+    }
 
     enum CodingKeys: String, CodingKey {
+        case id, name
         case userID = "user_id"
         case connectors
         case minimumPowerKW = "minimum_power_kw"
@@ -47,6 +59,43 @@ struct VehicleProfile: Codable, Equatable, Sendable {
         } ?? true
         return matchesConnector && meetsPower
     }
+}
+
+struct ActiveVehiclePreference: Codable, Sendable {
+    let userID: String
+    let activeVehicleID: UUID?
+
+    enum CodingKeys: String, CodingKey {
+        case userID = "user_id"
+        case activeVehicleID = "active_vehicle_id"
+    }
+}
+
+struct CatalogImportReport: Decodable, Sendable {
+    let fetched: Int
+    let included: Int
+    let `private`: Int
+    let invalid: Int
+    let license: Int
+    let providerIDsNeedingReview: [Int]
+    let providers: [CatalogProviderImportReport]?
+    let excludedIDs: CatalogExcludedIDs?
+}
+
+struct CatalogProviderImportReport: Decodable, Identifiable, Sendable {
+    let id: Int
+    let name: String
+    let fetched: Int
+    let included: Int
+    let `private`: Int
+    let invalid: Int
+    let license: Int
+}
+
+struct CatalogExcludedIDs: Decodable, Sendable {
+    let `private`: [Int]?
+    let invalid: [Int]?
+    let license: [Int]?
 }
 
 struct Coordinate: Codable, Equatable, Hashable, Sendable {
@@ -67,13 +116,37 @@ struct Connector: Codable, Equatable, Hashable, Sendable {
 enum StationSource: String, Codable, Equatable, Hashable, Sendable {
     case gentari
     case openChargeMap
+    case ownerProvided
 
     var attribution: String {
         switch self {
         case .gentari: "Gentari partner feed"
         case .openChargeMap: "Open Charge Map · CC BY 4.0"
+        case .ownerProvided: "Owner supplied · private sharing"
         }
     }
+}
+
+enum StationAccess: String, Codable, Equatable, Hashable, Sendable {
+    case publicAccess = "public"
+    case limited
+    case unknown
+    case privateAccess = "private"
+
+    var title: String {
+        switch self {
+        case .publicAccess: "Public access"
+        case .limited: "Limited access - check requirements"
+        case .unknown: "Access requirements unknown"
+        case .privateAccess: "Private · invited users only"
+        }
+    }
+}
+
+enum ChargingType: String, CaseIterable, Identifiable {
+    case ac = "AC"
+    case dc = "DC"
+    var id: Self { self }
 }
 
 enum AvailabilityState: String, Codable, Equatable, Hashable, Sendable {
@@ -244,6 +317,11 @@ struct ChargingStation: Codable, Equatable, Hashable, Identifiable, Sendable {
     let availability: Availability
     let price: Price?
     var source: StationSource? = nil
+    var sourceAttribution: String? = nil
+    var access: StationAccess? = nil
+    var chargePointCount: Int? = nil
+
+    var attributionText: String? { sourceAttribution ?? source?.attribution }
 
     var networkName: String {
         switch operatorName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
@@ -263,7 +341,8 @@ struct ChargingStation: Codable, Equatable, Hashable, Identifiable, Sendable {
     }
 
     var connectorSummary: String {
-        connectors
+        guard !connectors.isEmpty else { return "Connector details unavailable" }
+        return connectors
             .sorted { ($0.powerKW ?? -1) > ($1.powerKW ?? -1) }
             .map { connector in
                 guard let powerKW = connector.powerKW else { return "\(connector.kind.title) · Power unavailable" }
@@ -280,6 +359,46 @@ struct ChargingStation: Codable, Equatable, Hashable, Identifiable, Sendable {
     func distance(from coordinate: Coordinate?) -> CLLocationDistance? {
         guard let coordinate else { return nil }
         return self.coordinate.coreLocation.distance(from: coordinate.coreLocation)
+    }
+}
+
+struct CatalogNetworkSummary: Equatable, Identifiable, Sendable {
+    let network: String
+    let sites: Int
+    let knownChargePoints: Int
+    let sitesWithoutChargePointCount: Int
+    let hasDirectoryRecords: Bool
+    let hasPartnerFeed: Bool
+    let hasOwnerProvidedRecords: Bool
+
+    var id: String { network }
+}
+
+enum CatalogCoverage {
+    static func networks(in stations: [ChargingStation]) -> [CatalogNetworkSummary] {
+        var grouped: [String: [ChargingStation]] = [:]
+        for station in stations {
+            grouped[station.networkName, default: []].append(station)
+        }
+        let summaries = grouped.map { network, records in
+            let knownChargePoints = records.compactMap(\.chargePointCount).reduce(0, +)
+            let missingPointCounts = records.filter { $0.chargePointCount == nil }.count
+            let hasDirectoryRecords = records.contains { $0.source == .openChargeMap }
+            let hasPartnerFeed = records.contains { $0.source == .gentari }
+            let hasOwnerProvidedRecords = records.contains { $0.source == .ownerProvided }
+            return CatalogNetworkSummary(
+                network: network,
+                sites: records.count,
+                knownChargePoints: knownChargePoints,
+                sitesWithoutChargePointCount: missingPointCounts,
+                hasDirectoryRecords: hasDirectoryRecords,
+                hasPartnerFeed: hasPartnerFeed,
+                hasOwnerProvidedRecords: hasOwnerProvidedRecords
+            )
+        }
+        return summaries.sorted { lhs, rhs in
+            lhs.network.localizedStandardCompare(rhs.network) == .orderedAscending
+        }
     }
 }
 
@@ -325,6 +444,11 @@ enum StationDiscovery {
         query: String,
         availableNowOnly: Bool,
         network: String? = nil,
+        profile: VehicleProfile? = nil,
+        showAll: Bool = false,
+        chargingType: ChargingType? = nil,
+        minimumListedPowerKW: Double? = nil,
+        access: StationAccess? = nil,
         now: Date = .now
     ) -> [ChargingStation] {
         let search = query.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -335,7 +459,13 @@ enum StationDiscovery {
                 || station.operatorName.localizedStandardContains(search)
                 || station.networkName.localizedStandardContains(search)
             let matchesAvailability = !availableNowOnly || station.availability.isReportedAvailable(at: now)
-            return matchesSearch && matchesAvailability && (network == nil || station.networkName == network)
+            let matchesVehicle = showAll || profile.map { $0.accepts(station) } ?? true
+            let matchesChargingType = chargingType.map { type in
+                station.connectors.contains { type == .ac ? $0.kind == .type2 : $0.kind == .ccs2 || $0.kind == .chademo }
+            } ?? true
+            let matchesPower = minimumListedPowerKW.map { (station.maximumPowerKW ?? 0) >= $0 } ?? true
+            return matchesSearch && matchesAvailability && matchesVehicle && matchesChargingType && matchesPower &&
+                (network == nil || station.networkName == network) && (access == nil || (station.access ?? .unknown) == access)
         }
     }
 
@@ -386,8 +516,9 @@ struct CarPlaySnapshot: Codable, Equatable, Sendable {
     let isDemo: Bool
 
     init(stations: [ChargingStation], favoriteStationIDs: Set<String>, savedAt: Date, isDemo: Bool = false) {
-        self.stations = stations
-        self.favoriteStationIDs = favoriteStationIDs
+        let carPlayStations = stations.filter { $0.source != .ownerProvided }
+        self.stations = carPlayStations
+        self.favoriteStationIDs = favoriteStationIDs.intersection(Set(carPlayStations.map(\.id)))
         self.savedAt = savedAt
         self.isDemo = isDemo
     }
@@ -398,8 +529,11 @@ struct CarPlaySnapshot: Codable, Equatable, Sendable {
 
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
-        stations = try values.decode([ChargingStation].self, forKey: .stations)
+        let carPlayStations = try values.decode([ChargingStation].self, forKey: .stations)
+            .filter { $0.source != .ownerProvided }
+        stations = carPlayStations
         favoriteStationIDs = try values.decode(Set<String>.self, forKey: .favoriteStationIDs)
+            .intersection(Set(carPlayStations.map(\.id)))
         savedAt = try values.decode(Date.self, forKey: .savedAt)
         isDemo = try values.decodeIfPresent(Bool.self, forKey: .isDemo) ?? false
     }
@@ -408,59 +542,18 @@ struct CarPlaySnapshot: Codable, Equatable, Sendable {
 enum DemoData {
     static let stations: [ChargingStation] = [
         ChargingStation(
-            id: "gentari-petronas-solaris",
-            name: "PETRONAS Solaris Serdang",
-            address: "Serdang, Selangor",
-            coordinate: Coordinate(latitude: 2.9818, longitude: 101.7080),
-            operatorName: "Gentari",
-            connectors: [Connector(kind: .ccs2, powerKW: 180, count: 2), Connector(kind: .type2, powerKW: 22, count: 2)],
-            availability: Availability(state: .available, availableConnectors: 2, totalConnectors: 4, lastUpdated: .now),
-            price: Price(amountMYR: Decimal(string: "1.50")!, unit: .kWh, lastUpdated: .now),
-            source: .gentari
-        ),
-        ChargingStation(
-            id: "gentari-mid-valley",
-            name: "Mid Valley Megamall",
-            address: "Lingkaran Syed Putra, Kuala Lumpur",
-            coordinate: Coordinate(latitude: 3.1176, longitude: 101.6770),
-            operatorName: "Gentari",
-            connectors: [Connector(kind: .ccs2, powerKW: 120, count: 2), Connector(kind: .type2, powerKW: 22, count: 4)],
-            availability: Availability(state: .occupied, availableConnectors: 0, totalConnectors: 6, lastUpdated: .now),
-            price: Price(amountMYR: Decimal(string: "1.40")!, unit: .kWh, lastUpdated: .now),
-            source: .gentari
-        ),
-        ChargingStation(
-            id: "gentari-klcc",
-            name: "Kuala Lumpur Convention Centre",
-            address: "Jalan Pinang, Kuala Lumpur",
-            coordinate: Coordinate(latitude: 3.1536, longitude: 101.7130),
-            operatorName: "Gentari",
-            connectors: [Connector(kind: .type2, powerKW: 22, count: 6)],
-            availability: Availability(state: .available, availableConnectors: 3, totalConnectors: 6, lastUpdated: .now),
-            price: Price(amountMYR: Decimal(string: "0.10")!, unit: .minute, lastUpdated: .now),
-            source: .gentari
-        ),
-        ChargingStation(
-            id: "gentari-bangsar",
-            name: "Bangsar South",
-            address: "Kerinchi, Kuala Lumpur",
-            coordinate: Coordinate(latitude: 3.1106, longitude: 101.6654),
-            operatorName: "Gentari",
-            connectors: [Connector(kind: .ccs2, powerKW: 60, count: 2)],
-            availability: Availability(state: .offline, availableConnectors: 0, totalConnectors: 2, lastUpdated: .now),
-            price: nil,
-            source: .gentari
-        ),
-        ChargingStation(
             id: "ocm:505443",
             name: "DC Handal | IOI Mall Damansara",
             address: "Persiaran Surian, Petaling Jaya",
             coordinate: Coordinate(latitude: 3.1488504, longitude: 101.5946795),
             operatorName: "DC Handal",
-            connectors: [Connector(kind: .ccs2, powerKW: 240, count: 4)],
+            connectors: [Connector(kind: .type2, powerKW: 22, count: 1), Connector(kind: .ccs2, powerKW: 240, count: 4)],
             availability: Availability(state: .unknown, availableConnectors: nil, totalConnectors: nil, lastUpdated: nil),
             price: nil,
-            source: .openChargeMap
+            source: .openChargeMap,
+            sourceAttribution: "Open Charge Map Contributors · CC BY 4.0",
+            access: .limited,
+            chargePointCount: 5
         ),
         ChargingStation(
             id: "ocm:470421",
@@ -471,7 +564,10 @@ enum DemoData {
             connectors: [Connector(kind: .ccs2, powerKW: 180, count: 5)],
             availability: Availability(state: .unknown, availableConnectors: nil, totalConnectors: nil, lastUpdated: nil),
             price: nil,
-            source: .openChargeMap
+            source: .openChargeMap,
+            sourceAttribution: "Open Charge Map Contributors · CC BY 4.0",
+            access: .publicAccess,
+            chargePointCount: 5
         ),
         directoryStation(
             id: 279460, name: "Pavilion KL", address: "168 Jalan Bukit Bintang, Kuala Lumpur",
@@ -481,17 +577,17 @@ enum DemoData {
         directoryStation(
             id: 479684, name: "Shell LPT 1 RNR Temerloh KTN Bound", address: "KM 129.5 East Bound, Temerloh, Pahang",
             latitude: 3.512228012084961, longitude: 102.44186401367188, operatorName: "Shell Recharge (Malaysia)",
-            connectors: [Connector(kind: .ccs2, powerKW: 180, count: 2)]
+            connectors: [Connector(kind: .ccs2, powerKW: 180, count: 2)], chargePointCount: 2
         ),
         directoryStation(
             id: 480555, name: "TNB Electron - Wisma TNB Bagan Serai", address: "Jalan Taiping Batu 10, Bagan Serai, Perak",
             latitude: 5.0058708, longitude: 100.5426283, operatorName: "TNB Electron (MY)",
-            connectors: [Connector(kind: .ccs2, powerKW: 240, count: 3)]
+            connectors: [Connector(kind: .ccs2, powerKW: 240, count: 3)], chargePointCount: 3
         ),
         directoryStation(
             id: 480140, name: "TNB Electron - Yard TNB PRCC Bayan Lepas", address: "Lebuhraya Kampung Jawa, Bayan Lepas, Penang",
             latitude: 5.316405322200055, longitude: 100.2957099672758, operatorName: "TNB Electron (MY)",
-            connectors: [Connector(kind: .ccs2, powerKW: 200, count: 5)]
+            connectors: [Connector(kind: .ccs2, powerKW: 200, count: 5)], chargePointCount: 5
         ),
         directoryStation(
             id: 505071, name: "JomCharge | TTDI CU Mart", address: "11 Jalan Tun Mohd Fuad, Kuala Lumpur",
@@ -501,7 +597,7 @@ enum DemoData {
         directoryStation(
             id: 497573, name: "chargeEV | TF Value-Mart Gemas", address: "33 Jalan DS 2/2, Gemas, Negeri Sembilan",
             latitude: 2.5864782970035662, longitude: 102.57496456588626, operatorName: "chargeEV (MY)",
-            connectors: [Connector(kind: .ccs2, powerKW: 60, count: 2)]
+            connectors: [Connector(kind: .ccs2, powerKW: 60, count: 2)], chargePointCount: 2
         ),
         directoryStation(
             id: 259727, name: "ChargeSini Station Starbucks Megamall", address: "Berjaya Megamall, Kuantan, Pahang",
@@ -512,14 +608,14 @@ enum DemoData {
 
     private static func directoryStation(
         id: Int, name: String, address: String, latitude: Double, longitude: Double,
-        operatorName: String, connectors: [Connector]
+        operatorName: String, connectors: [Connector], chargePointCount: Int? = nil
     ) -> ChargingStation {
         ChargingStation(
             id: "ocm:\(id)", name: name, address: address,
             coordinate: Coordinate(latitude: latitude, longitude: longitude), operatorName: operatorName,
             connectors: connectors,
             availability: Availability(state: .unknown, availableConnectors: nil, totalConnectors: nil, lastUpdated: nil),
-            price: nil, source: .openChargeMap
+            price: nil, source: .openChargeMap, chargePointCount: chargePointCount
         )
     }
 }

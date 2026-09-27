@@ -33,6 +33,43 @@ struct VoltWayTests {
         #expect(!charger.availability.isReportedAvailable(at: now))
     }
 
+    @Test("All sites retains unknown connectors while compatible discovery excludes them")
+    func allSitesAndCompatibility() {
+        let unknown = ChargingStation(
+            id: "ocm:2", name: "Unknown plug", address: "Kuala Lumpur",
+            coordinate: Coordinate(latitude: 3.14, longitude: 101.68), operatorName: "Directory",
+            connectors: [], availability: Availability(state: .unknown, availableConnectors: nil, totalConnectors: nil, lastUpdated: nil),
+            price: nil, source: .openChargeMap
+        )
+        let profile = VehicleProfile(connectors: [.ccs2], minimumPowerKW: nil)
+        #expect(!profile.accepts(unknown))
+        #expect(StationDiscovery.visibleStations(from: [unknown], query: "", availableNowOnly: false,
+            profile: profile, showAll: true).map(\.id) == ["ocm:2"])
+        #expect(StationDiscovery.visibleStations(from: [unknown], query: "", availableNowOnly: false,
+            profile: profile, showAll: false).isEmpty)
+        #expect(unknown.connectorSummary == "Connector details unavailable")
+    }
+
+    @Test("Quick filters share map and list results without treating directory status as live")
+    func quickDiscoveryFilters() {
+        let ac = ChargingStation(
+            id: "ocm:3", name: "AC site", address: "Malaysia",
+            coordinate: Coordinate(latitude: 3.14, longitude: 101.68), operatorName: "ChargeSini",
+            connectors: [Connector(kind: .type2, powerKW: 22, count: 1)],
+            availability: Availability(state: .unknown, availableConnectors: nil, totalConnectors: nil, lastUpdated: nil),
+            price: nil, source: .openChargeMap, sourceAttribution: "ChargeSini via Open Charge Map · CC0", access: .limited
+        )
+        let profile = VehicleProfile(connectors: [.ccs2], minimumPowerKW: nil)
+        #expect(StationDiscovery.visibleStations(from: [ac], query: "", availableNowOnly: false,
+            profile: profile, showAll: true, chargingType: .ac, minimumListedPowerKW: 20, access: .limited).map(\.id) == ["ocm:3"])
+        #expect(StationDiscovery.visibleStations(from: [ac], query: "", availableNowOnly: true,
+            profile: profile, showAll: true).isEmpty)
+        #expect(ac.attributionText == "ChargeSini via Open Charge Map · CC0")
+        let unclassified = station(id: "gentari-unknown-access", connector: .ccs2, power: 100, state: .unknown)
+        #expect(StationDiscovery.visibleStations(from: [ac, unclassified], query: "", availableNowOnly: false,
+            showAll: true, access: .unknown).map(\.id) == ["gentari-unknown-access"])
+    }
+
     @Test("Available chargers sort ahead of unavailable chargers")
     func stationSorting() throws {
         let profile = VehicleProfile(connectors: [.ccs2], minimumPowerKW: nil)
@@ -102,13 +139,31 @@ struct VoltWayTests {
             #expect(ChargingCostEstimate.amount(for: charger.price, energyKWh: 20) == nil)
             #expect(charger.connectors.contains { $0.kind == .ccs2 || $0.kind == .type2 })
         }
+        #expect(DemoData.stations.allSatisfy { $0.availability.state == .unknown && $0.price == nil })
+        #expect(StationDiscovery.visibleStations(from: DemoData.stations, query: "", availableNowOnly: true).isEmpty)
+    }
+
+    @Test("Coverage separates station sites from source-reported charge points")
+    func sourceCoverageCounts() throws {
+        let coverage = CatalogCoverage.networks(in: DemoData.stations)
+        let handal = try #require(coverage.first { $0.network == "DC Handal" })
+        #expect(handal.sites == 1)
+        #expect(handal.knownChargePoints == 5)
+        #expect(handal.sitesWithoutChargePointCount == 0)
+        #expect(handal.hasDirectoryRecords)
+        #expect(!handal.hasPartnerFeed)
+
+        let shell = try #require(coverage.first { $0.network == "Shell Recharge" })
+        #expect(shell.sites == 2)
+        #expect(shell.knownChargePoints == 2)
+        #expect(shell.sitesWithoutChargePointCount == 1)
     }
 
     @Test("Network aliases produce one filter choice and identical map/list results")
     func networkDiscovery() {
         let stations = DemoData.stations
         let choices = StationDiscovery.networks(from: stations)
-        #expect(Array(choices.prefix(3)) == ["Shell Recharge", "TNB Electron", "Gentari"])
+        #expect(Array(choices.prefix(3)) == ["Shell Recharge", "TNB Electron", "ChargeSini"])
         #expect(stations.allSatisfy(VehicleProfile.demo.accepts))
         #expect(choices.contains("Shell Recharge"))
         #expect(choices.contains("TNB Electron"))
@@ -299,6 +354,24 @@ struct VoltWayTests {
         #expect(CarPlaySnapshotStore.load(defaults: defaults).isDemo)
     }
 
+    @Test("Private charger coordinates are excluded from CarPlay snapshots")
+    func privateSitesStayOutOfCarPlay() {
+        let publicStation = DemoData.stations[0]
+        let privateStation = ChargingStation(
+            id: "private:site-1", name: "Workplace depot", address: "Kuala Lumpur",
+            coordinate: Coordinate(latitude: 3.14, longitude: 101.68), operatorName: "Workplace",
+            connectors: [Connector(kind: .type2, powerKW: 22, count: 1)],
+            availability: Availability(state: .unknown, availableConnectors: nil, totalConnectors: nil, lastUpdated: nil),
+            price: nil, source: .ownerProvided, access: .privateAccess
+        )
+        let snapshot = CarPlaySnapshot(
+            stations: [publicStation, privateStation],
+            favoriteStationIDs: [publicStation.id, privateStation.id], savedAt: now
+        )
+        #expect(snapshot.stations.map(\.id) == [publicStation.id])
+        #expect(snapshot.favoriteStationIDs == [publicStation.id])
+    }
+
     @Test("Older CarPlay snapshots without a demo field remain readable")
     func legacyCarPlaySnapshot() throws {
         let encoder = JSONEncoder()
@@ -340,9 +413,24 @@ struct VoltWayTests {
         let original = station(id: "gentari-old", connector: .ccs2, power: 120, state: .available)
         var object = try #require(JSONSerialization.jsonObject(with: encoder.encode(original)) as? [String: Any])
         object.removeValue(forKey: "source")
+        object.removeValue(forKey: "sourceAttribution")
+        object.removeValue(forKey: "access")
         let decoded = try decoder.decode(ChargingStation.self, from: JSONSerialization.data(withJSONObject: object))
         #expect(decoded.source == nil)
+        #expect(decoded.sourceAttribution == nil)
+        #expect(decoded.access == nil)
         #expect(decoded.id == original.id)
+    }
+
+    @Test("Migrated vehicle records retain their identity and name")
+    func migratedVehicleProfile() throws {
+        let id = UUID(uuidString: "00000000-0000-0000-0000-000000000042")!
+        let record = #"{"id":"00000000-0000-0000-0000-000000000042","user_id":"user-1","name":"Family EV","connectors":["ccs2"],"minimum_power_kw":50}"#
+        let profile = try JSONDecoder().decode(VehicleProfile.self, from: Data(record.utf8))
+        #expect(profile.id == id)
+        #expect(profile.name == "Family EV")
+        #expect(profile.connectors == [.ccs2])
+        #expect(profile.minimumPowerKW == 50)
     }
 
     private func station(
@@ -419,11 +507,11 @@ struct BackendClientTests {
         let store = VoltWayStore(configuration: configuration, backend: client)
         await store.signIn(email: "driver@example.com", password: "password-123")
         let firstCheck = try #require(store.lastSuccessfulStationFetchAt)
-        #expect(store.stations.map(\.id) == ["gentari-petronas-solaris"])
+        #expect(store.stations.map(\.id) == ["ocm:505443"])
 
         await store.refreshStations()
         #expect(store.lastSuccessfulStationFetchAt == firstCheck)
-        #expect(store.stations.map(\.id) == ["gentari-petronas-solaris"])
+        #expect(store.stations.map(\.id) == ["ocm:505443"])
         #expect(store.errorMessage == "Refresh failed")
 
         await store.refreshStations()
@@ -434,7 +522,7 @@ struct BackendClientTests {
         #expect(store.lastSuccessfulStationFetchAt == nil)
     }
 
-    @Test("Changing the vehicle invalidates a prior list-check time when its refresh fails")
+    @Test("Changing the vehicle keeps the catalog snapshot and list-check time")
     @MainActor func profileChangeInvalidatesFetchTime() async throws {
         let stationRequests = LockedCounter()
         MockURLProtocol.handler = { request in
@@ -449,6 +537,7 @@ struct BackendClientTests {
                     : (503, Data(#"{"message":"Refresh failed"}"#.utf8))
             }
             if path == "/rest/v1/vehicle_profiles", request.httpMethod == "POST" { return (204, Data()) }
+            if path == "/rest/v1/user_preferences", request.httpMethod == "POST" { return (204, Data()) }
             return (200, Data("[]".utf8))
         }
         defer { MockURLProtocol.handler = nil }
@@ -460,9 +549,109 @@ struct BackendClientTests {
 
         let saved = await store.saveProfile(connectors: [.ccs2], minimumPowerKW: 100)
         #expect(saved)
-        #expect(store.lastSuccessfulStationFetchAt == nil)
-        #expect(store.errorMessage == "Refresh failed")
+        #expect(store.lastSuccessfulStationFetchAt != nil)
+        #expect(store.errorMessage == nil)
+        #expect(stationRequests.value == 1)
         await store.signOut()
+    }
+
+    @Test("Switching active vehicles changes local compatibility without another catalog request")
+    @MainActor func activeVehicleSwitch() async throws {
+        let first = VehicleProfile(id: UUID(uuidString: "00000000-0000-0000-0000-000000000011")!, userID: "user-1",
+                                   name: "City EV", connectors: [.type2], minimumPowerKW: nil)
+        let second = VehicleProfile(id: UUID(uuidString: "00000000-0000-0000-0000-000000000012")!, userID: "user-1",
+                                    name: "Highway EV", connectors: [.ccs2], minimumPowerKW: 100)
+        let encoder = JSONEncoder()
+        let profiles = try encoder.encode([first, second])
+        let preference = try encoder.encode([ActiveVehiclePreference(userID: "user-1", activeVehicleID: first.id)])
+        let charger = ChargingStation(id: "ccs-only", name: "Highway site", address: "Malaysia",
+                                      coordinate: Coordinate(latitude: 3.14, longitude: 101.68), operatorName: "Gentari",
+                                      connectors: [Connector(kind: .ccs2, powerKW: 150, count: 2)],
+                                      availability: Availability(state: .unknown, availableConnectors: nil, totalConnectors: nil, lastUpdated: nil),
+                                      price: nil)
+        let stationResponse = Data(#"{"stations":"#.utf8) + (try encoder.encode([charger])) + Data("}".utf8)
+        let requests = LockedCounter()
+        MockURLProtocol.handler = { request in
+            let path = request.url?.path ?? ""
+            if path == "/auth/v1/token" {
+                return (200, Data(#"{"access_token":"fresh","refresh_token":"refresh-1","user":{"id":"user-1","email":"driver@example.com"}}"#.utf8))
+            }
+            if path == "/rest/v1/vehicle_profiles" { return (200, profiles) }
+            if path == "/rest/v1/user_preferences", request.httpMethod == "GET" { return (200, preference) }
+            if path == "/rest/v1/user_preferences", request.httpMethod == "POST" { return (204, Data()) }
+            if path == "/functions/v1/stations" { requests.increment(); return (200, stationResponse) }
+            return (200, Data("[]".utf8))
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let store = VoltWayStore(configuration: configuration, backend: makeClient(account: "test-\(UUID().uuidString)"))
+        await store.signIn(email: "driver@example.com", password: "password-123")
+        #expect(store.activeVehicleID == first.id)
+        #expect(store.compatibleStations.isEmpty)
+        await store.selectVehicle(second)
+        #expect(store.activeVehicleID == second.id)
+        #expect(store.profile.name == "Highway EV")
+        #expect(store.compatibleStations.map(\.id) == ["ccs-only"])
+        #expect(requests.value == 1)
+        await store.signOut()
+    }
+
+    @Test("A newly private directory listing stays saved but disappears from discovery")
+    @MainActor func privateFavoriteExcluded() async throws {
+        let station = try #require(DemoData.stations.first { $0.id == "ocm:279460" })
+        let favorite = FavoriteStation(userID: "user-1", stationID: station.id, stationSnapshot: station, createdAt: nil)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let favoriteResponse = try encoder.encode([favorite])
+        MockURLProtocol.handler = { request in
+            let path = request.url?.path ?? ""
+            if path == "/auth/v1/token" {
+                return (200, Data(#"{"access_token":"fresh","refresh_token":"refresh-1","user":{"id":"user-1","email":"driver@example.com"}}"#.utf8))
+            }
+            if path == "/rest/v1/favorite_stations" { return (200, favoriteResponse) }
+            if path == "/functions/v1/stations" {
+                return (200, Data(#"{"stations":[],"catalogImportReport":{"fetched":1,"included":0,"private":1,"invalid":0,"license":0,"providerIDsNeedingReview":[],"excludedIDs":{"private":[279460],"invalid":[],"license":[]}}}"#.utf8))
+            }
+            return (200, Data("[]".utf8))
+        }
+        defer { MockURLProtocol.handler = nil }
+        let store = VoltWayStore(configuration: configuration, backend: makeClient(account: "test-\(UUID().uuidString)"))
+        await store.signIn(email: "driver@example.com", password: "password-123")
+        #expect(store.favorites.count == 1)
+        #expect(store.favoriteStations.isEmpty)
+        await store.signOut()
+    }
+
+    @Test("Private charger creation requires authenticated owner-consent RPC")
+    func privateSiteCreationRPC() async throws {
+        let station = ChargingStation(
+            id: "owner-site", name: "Home charger", address: "Petaling Jaya",
+            coordinate: Coordinate(latitude: 3.1, longitude: 101.6), operatorName: "Owner supplied",
+            connectors: [Connector(kind: .type2, powerKW: 11, count: 1)],
+            availability: Availability(state: .unknown, availableConnectors: nil, totalConnectors: nil, lastUpdated: nil),
+            price: nil, source: .ownerProvided, sourceAttribution: "Owner supplied"
+        )
+        let id = UUID(uuidString: "00000000-0000-0000-0000-000000000042")!
+        let client = makeClient(account: "test-\(UUID().uuidString)")
+        MockURLProtocol.handler = { request in
+            #expect(request.url?.path == "/rest/v1/rpc/create_private_charger_site")
+            #expect(request.httpMethod == "POST")
+            #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer caller-token")
+            let body = try? JSONSerialization.jsonObject(with: request.httpBody ?? Data()) as? [String: Any]
+            #expect(body?["p_id"] as? String == id.uuidString)
+            #expect(body?["p_owner_consent"] as? Bool == true)
+            #expect(body?["p_invited_email"] as? String == "guest@example.com")
+            let submittedStation = body?["p_station"] as? [String: Any]
+            #expect(submittedStation?["id"] as? String == "owner-site")
+            #expect(submittedStation?["source"] as? String == "ownerProvided")
+            return (200, Data("\"\(id.uuidString)\"".utf8))
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        try await client.createPrivateSite(
+            id: id, station: station, invitedEmail: "guest@example.com",
+            session: UserSession(userID: "user-1", email: "owner@example.com", accessToken: "caller-token", refreshToken: "refresh")
+        )
     }
 
     @Test("Concurrent expired-token requests share one refresh and persist rotated tokens")
@@ -502,7 +691,7 @@ struct BackendClientTests {
         try await client.signOut()
     }
 
-    @Test("Charger search sends connector filters but never coordinates")
+    @Test("Charger catalog request sends no vehicle or location filters")
     func coordinatePrivacy() async throws {
         let observedURL = LockedURL()
         MockURLProtocol.handler = { request in
@@ -519,8 +708,8 @@ struct BackendClientTests {
         let stations = try await client.stations(profile: .demo, session: session)
         #expect(stations.stations.isEmpty)
         let url = try #require(observedURL.value)
-        let query = try #require(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems)
-        #expect(query.contains { $0.name == "connectors" })
+        let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        #expect(query.isEmpty)
         #expect(!query.contains { $0.name == "latitude" || $0.name == "longitude" })
         try await client.signOut()
     }
@@ -535,6 +724,12 @@ struct BackendClientTests {
             if path == "/rest/v1/vehicle_profiles", request.httpMethod == "POST" {
                 return (500, Data(#"{"message":"Save failed"}"#.utf8))
             }
+            if path == "/rest/v1/vehicle_profiles", request.httpMethod == "GET" {
+                return (200, Data(#"[{"id":"00000000-0000-0000-0000-000000000041","user_id":"user-1","name":"Existing EV","connectors":["type2"],"minimum_power_kw":null}]"#.utf8))
+            }
+            if path == "/rest/v1/user_preferences", request.httpMethod == "GET" {
+                return (200, Data(#"[{"user_id":"user-1","active_vehicle_id":"00000000-0000-0000-0000-000000000041"}]"#.utf8))
+            }
             if path == "/functions/v1/stations" { return (200, Data(#"{"stations":[]}"#.utf8)) }
             return (200, Data("[]".utf8))
         }
@@ -545,9 +740,10 @@ struct BackendClientTests {
         await store.signIn(email: "driver@example.com", password: "password-123")
         let previous = store.profile
         let previousFetchAt = try #require(store.lastSuccessfulStationFetchAt)
-        let saved = await store.saveProfile(connectors: [.ccs2], minimumPowerKW: 100)
+        let saved = await store.saveProfile(connectors: [.ccs2], minimumPowerKW: 100, name: "Renamed EV")
         #expect(!saved)
         #expect(store.profile == previous)
+        #expect(store.vehicles.first?.name == "Existing EV")
         #expect(store.lastSuccessfulStationFetchAt == previousFetchAt)
         #expect(store.errorMessage == "Save failed")
         CarPlaySnapshotStore.save(stations: [DemoData.stations[0]], favoriteStationIDs: [])

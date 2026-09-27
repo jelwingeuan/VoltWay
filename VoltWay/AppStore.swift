@@ -6,11 +6,15 @@ import Observation
 final class VoltWayStore {
     private(set) var session: UserSession?
     private(set) var profile: VehicleProfile
+    private(set) var vehicles: [VehicleProfile]
+    private(set) var activeVehicleID: UUID?
     private(set) var stations: [ChargingStation]
     private(set) var favorites: [FavoriteStation] = []
     private(set) var currentLocation: Coordinate?
     private(set) var lastSuccessfulStationFetchAt: Date?
     private(set) var catalogSyncedAt: Date?
+    private(set) var catalogImportReport: CatalogImportReport?
+    private(set) var duplicateCount = 0
     private(set) var sourceWarnings: [String] = []
     private(set) var isBootstrapping = true
     private(set) var isLoadingStations = false
@@ -28,6 +32,8 @@ final class VoltWayStore {
         locationService = LocationService()
         isDemoMode = !configuration.isConfigured
         profile = .demo
+        vehicles = isDemoMode ? [.demo] : []
+        activeVehicleID = isDemoMode ? VehicleProfile.demo.id : nil
         stations = isDemoMode ? DemoData.stations : []
     }
 
@@ -40,15 +46,19 @@ final class VoltWayStore {
     }
 
     var favoriteStations: [ChargingStation] {
-        favorites.map { favorite in
-            stations.first(where: { $0.id == favorite.stationID }) ?? favorite.stationSnapshot
+        return favorites.compactMap { favorite in
+            if let current = stations.first(where: { $0.id == favorite.stationID }) { return current }
+            // A directory snapshot cannot prove a site is still public or licensed after it leaves the catalog.
+            return favorite.stationSnapshot.source == .openChargeMap || favorite.stationSnapshot.source == .ownerProvided
+                || favorite.stationID.hasPrefix("ocm:") || favorite.stationID.hasPrefix("private:")
+                ? nil : favorite.stationSnapshot
         }
     }
 
     var profileSummary: String {
         let connectors = profile.connectors.map(\.title).joined(separator: " + ")
-        guard let minimumPowerKW = profile.minimumPowerKW else { return connectors }
-        return "\(connectors) · \(minimumPowerKW.formatted(.number.precision(.fractionLength(0))))+ kW"
+        guard let minimumPowerKW = profile.minimumPowerKW else { return "\(profile.name) · \(connectors)" }
+        return "\(profile.name) · \(connectors) · \(minimumPowerKW.formatted(.number.precision(.fractionLength(0))))+ kW"
     }
 
     func bootstrap() async {
@@ -128,10 +138,15 @@ final class VoltWayStore {
             try await backend.signOut()
             session = nil
             stations = []
+            vehicles = []
+            activeVehicleID = nil
+            profile = VehicleProfile(connectors: [], minimumPowerKW: nil)
             favorites = []
             currentLocation = nil
             lastSuccessfulStationFetchAt = nil
             catalogSyncedAt = nil
+            catalogImportReport = nil
+            duplicateCount = 0
             sourceWarnings = []
             CarPlaySnapshotStore.clear()
         } catch {
@@ -147,11 +162,84 @@ final class VoltWayStore {
             stations = result.stations
             sourceWarnings = result.warnings ?? []
             catalogSyncedAt = result.catalogSyncedAt
+            catalogImportReport = result.catalogImportReport
+            duplicateCount = result.duplicateCount ?? 0
             if !isDemoMode { lastSuccessfulStationFetchAt = .now }
             errorMessage = nil
             persistCarPlaySnapshot()
         } catch {
             show(error)
+        }
+    }
+
+    func addPrivateSite(
+        name: String,
+        address: String,
+        latitude: Double,
+        longitude: Double,
+        operatorName: String,
+        connector: ConnectorKind,
+        powerKW: Double?,
+        chargePointCount: Int?,
+        invitedEmail: String,
+        ownerPermissionGranted: Bool
+    ) async -> Bool {
+        guard let session else {
+            errorMessage = "Sign in to share a private charger."
+            return false
+        }
+        let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanAddress = address.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanOperator = operatorName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanEmail = invitedEmail.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !cleanName.isEmpty, cleanName.count <= 100, !cleanAddress.isEmpty, cleanAddress.count <= 240,
+              !cleanOperator.isEmpty, cleanOperator.count <= 100,
+              latitude >= 0.8, latitude <= 7.5, longitude >= 99, longitude <= 120.5,
+              ownerPermissionGranted else {
+            errorMessage = "Enter valid Malaysian site details and confirm owner permission."
+            return false
+        }
+        guard powerKW.map({ $0.isFinite && $0 > 0 && $0 <= 1_000 }) ?? true,
+              chargePointCount.map({ $0 > 0 && $0 <= 1_000 }) ?? true else {
+            errorMessage = "Check the listed power and charge point count."
+            return false
+        }
+        if !cleanEmail.isEmpty,
+           cleanEmail.range(of: #"^[^\s@]+@[^\s@]+\.[^\s@]+$"#, options: .regularExpression) == nil {
+            errorMessage = "Enter a valid invitation email or leave it blank."
+            return false
+        }
+
+        let id = UUID()
+        let station = ChargingStation(
+            id: "private:\(id.uuidString.lowercased())",
+            name: cleanName,
+            address: cleanAddress,
+            coordinate: Coordinate(latitude: latitude, longitude: longitude),
+            operatorName: cleanOperator,
+            connectors: [Connector(kind: connector, powerKW: powerKW, count: chargePointCount)],
+            availability: Availability(state: .unknown, availableConnectors: nil, totalConnectors: nil, lastUpdated: nil),
+            price: nil,
+            source: .ownerProvided,
+            sourceAttribution: "Owner supplied · shared by invitation",
+            access: .privateAccess,
+            chargePointCount: chargePointCount
+        )
+        do {
+            try await backend.createPrivateSite(
+                id: id,
+                station: station,
+                invitedEmail: cleanEmail.isEmpty ? nil : cleanEmail,
+                session: session
+            )
+            await refreshStations()
+            noticeMessage = cleanEmail.isEmpty
+                ? "Private charger saved for your account."
+                : "Private charger saved and shared with the invited account."
+            return true
+        } catch {
+            show(error)
+            return false
         }
     }
 
@@ -167,7 +255,8 @@ final class VoltWayStore {
         }
     }
 
-    func saveProfile(connectors: Set<ConnectorKind>, minimumPowerKW: Double?) async -> Bool {
+    func saveProfile(connectors: Set<ConnectorKind>, minimumPowerKW: Double?, name: String? = nil,
+                     vehicleID: UUID? = nil, createsNew: Bool = false) async -> Bool {
         guard !connectors.isEmpty else {
             errorMessage = "Choose at least one connector."
             return false
@@ -177,32 +266,64 @@ final class VoltWayStore {
             return false
         }
 
-        let previous = profile
-        let previousFetchAt = lastSuccessfulStationFetchAt
-        let previousCatalogSyncAt = catalogSyncedAt
-        let previousSourceWarnings = sourceWarnings
-        profile = VehicleProfile(
+        let previous = createsNew ? nil : vehicles.first { $0.id == (vehicleID ?? profile.id) }
+        let vehicleName = (name ?? previous?.name ?? "My EV").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !vehicleName.isEmpty && vehicleName.count <= 60 else {
+            errorMessage = "Vehicle name must be 1 to 60 characters."
+            return false
+        }
+        let updated = VehicleProfile(
+            id: previous?.id ?? UUID(),
             userID: session?.userID,
+            name: vehicleName,
             connectors: connectors.sorted { $0.rawValue < $1.rawValue },
             minimumPowerKW: minimumPowerKW,
             updatedAt: .now
         )
-        lastSuccessfulStationFetchAt = nil
-
         do {
-            if let session { try await backend.saveProfile(profile, session: session) }
+            if let session {
+                try await backend.saveProfile(updated, session: session)
+                if createsNew || vehicles.isEmpty { try await backend.setActiveVehicle(updated.id, session: session) }
+            }
+            if let index = vehicles.firstIndex(where: { $0.id == updated.id }) { vehicles[index] = updated }
+            else { vehicles.append(updated) }
+            if createsNew || previous?.id == activeVehicleID || activeVehicleID == nil {
+                activeVehicleID = updated.id
+                profile = updated
+            }
             persistCarPlaySnapshot()
-            await refreshStations()
+            errorMessage = nil
             return true
         } catch {
-            profile = previous
-            lastSuccessfulStationFetchAt = previousFetchAt
-            catalogSyncedAt = previousCatalogSyncAt
-            sourceWarnings = previousSourceWarnings
-            persistCarPlaySnapshot()
             show(error)
             return false
         }
+    }
+
+    func selectVehicle(_ vehicle: VehicleProfile) async {
+        guard vehicles.contains(where: { $0.id == vehicle.id }) else { return }
+        do {
+            if let session { try await backend.setActiveVehicle(vehicle.id, session: session) }
+            activeVehicleID = vehicle.id
+            profile = vehicle
+            persistCarPlaySnapshot()
+        } catch { show(error) }
+    }
+
+    func deleteVehicle(_ vehicle: VehicleProfile) async {
+        guard vehicles.contains(where: { $0.id == vehicle.id }) else { return }
+        do {
+            if let session { try await backend.deleteProfile(vehicle.id, session: session) }
+            vehicles.removeAll { $0.id == vehicle.id }
+            let deletedActiveVehicle = activeVehicleID == vehicle.id
+            if deletedActiveVehicle {
+                let next = vehicles.first
+                activeVehicleID = next?.id
+                profile = next ?? VehicleProfile(userID: session?.userID, connectors: [], minimumPowerKW: nil)
+            }
+            persistCarPlaySnapshot()
+            if deletedActiveVehicle, let session { try await backend.setActiveVehicle(activeVehicleID, session: session) }
+        } catch { show(error) }
     }
 
     func toggleFavorite(_ station: ChargingStation) async {
@@ -233,11 +354,20 @@ final class VoltWayStore {
         noticeMessage = nil
     }
 
+    func showValidationError(_ message: String) {
+        errorMessage = message
+    }
+
     private func loadAccountData() async throws {
         guard let session else { return }
-        async let loadedProfile = backend.loadProfile(session: session)
+        async let loadedProfiles = backend.loadProfiles(session: session)
+        async let loadedActiveID = backend.loadActiveVehicleID(session: session)
         async let loadedFavorites = backend.loadFavorites(session: session)
-        profile = try await loadedProfile ?? VehicleProfile(userID: session.userID, connectors: [], minimumPowerKW: nil, updatedAt: nil)
+        vehicles = try await loadedProfiles.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        let selectedID = try await loadedActiveID
+        let selected = vehicles.first(where: { $0.id == selectedID }) ?? vehicles.first
+        activeVehicleID = selected?.id
+        profile = selected ?? VehicleProfile(userID: session.userID, connectors: [], minimumPowerKW: nil)
         favorites = try await loadedFavorites
         await refreshStations()
     }

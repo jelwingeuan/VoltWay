@@ -24,6 +24,7 @@ test("Authenticated search serves cached open data when Gentari is unavailable",
   globalThis.fetch = async (url) => {
     upstream.push(String(url));
     if (String(url).includes("/auth/v1/user")) return Response.json({ id: "user-1" });
+    if (String(url).includes("/private_charger_sites")) return Response.json([]);
     return Response.json([{
       stations: [{
         id: "ocm:42", name: "City Mall", address: "Kuala Lumpur", operatorName: "DC Handal",
@@ -33,6 +34,7 @@ test("Authenticated search serves cached open data when Gentari is unavailable",
         price: null, source: "openChargeMap",
       }],
       synced_at: new Date().toISOString(),
+      import_report: {},
     }]);
   };
   try {
@@ -41,11 +43,47 @@ test("Authenticated search serves cached open data when Gentari is unavailable",
     assert.equal(response.status, 200);
     assert.deepEqual(data.stations.map((station) => station.id), ["ocm:42"]);
     assert.equal(data.warnings.length, 1);
-    assert.equal(upstream.length, 2);
+    assert.equal(data.catalogImportReport, null);
+    assert.deepEqual(data.duplicateIDs, []);
+    assert.equal(upstream.length, 3);
     assert.ok(upstream.every((url) => !url.includes("latitude") && !url.includes("longitude")));
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("Private station reads use the signed-in JWT so database RLS can filter invitees", async () => {
+  const originalFetch = globalThis.fetch;
+  let privateRequest;
+  globalThis.fetch = async (url, options) => {
+    if (String(url).includes("/auth/v1/user")) return Response.json({ id: "user-1" });
+    if (String(url).includes("/private_charger_sites")) {
+      privateRequest = { url: String(url), headers: options.headers };
+      return Response.json([{
+        id: "site-1",
+        station: {
+          id: "forged", name: "Shared depot", address: "Kuala Lumpur",
+          coordinate: { latitude: 3.14, longitude: 101.68 }, operatorName: "Workplace",
+          connectors: [{ kind: "type2", powerKW: 22, count: 1 }],
+          availability: { state: "available", availableConnectors: 1, totalConnectors: 1 },
+          price: { amountMYR: 0, unit: "kWh" }, access: "public", source: "openChargeMap",
+        },
+      }]);
+    }
+    return new Response("Unavailable", { status: 503 });
+  };
+  try {
+    const response = await handler(request());
+    const data = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(privateRequest.headers.Authorization, "Bearer signed-in-user");
+    assert.equal(privateRequest.headers.apikey, "public-anon-key");
+    assert.deepEqual(new URL(privateRequest.url).searchParams.getAll("select"), ["id,station"]);
+    assert.equal(data.stations[0].id, "private:site-1");
+    assert.equal(data.stations[0].access, "private");
+    assert.equal(data.stations[0].availability.state, "unknown");
+    assert.equal(data.stations[0].price, null);
+  } finally { globalThis.fetch = originalFetch; }
 });
 
 test("Missing both sources is an error, not a fabricated demo result", async () => {

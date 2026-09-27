@@ -39,6 +39,19 @@ struct StationFetchResult: Decodable, Sendable {
     let stations: [ChargingStation]
     let warnings: [String]?
     let catalogSyncedAt: Date?
+    let catalogImportReport: CatalogImportReport?
+    let duplicateCount: Int?
+    let privateSiteCount: Int?
+
+    init(stations: [ChargingStation], warnings: [String]? = nil, catalogSyncedAt: Date? = nil,
+         catalogImportReport: CatalogImportReport? = nil, duplicateCount: Int? = nil, privateSiteCount: Int? = nil) {
+        self.stations = stations
+        self.warnings = warnings
+        self.catalogSyncedAt = catalogSyncedAt
+        self.catalogImportReport = catalogImportReport
+        self.duplicateCount = duplicateCount
+        self.privateSiteCount = privateSiteCount
+    }
 }
 
 actor BackendClient {
@@ -124,21 +137,38 @@ actor BackendClient {
     func stations(profile: VehicleProfile, session: UserSession?) async throws -> StationFetchResult {
         guard configuration.isConfigured else { return StationFetchResult(stations: DemoData.stations, warnings: nil, catalogSyncedAt: nil) }
         guard let session else { throw BackendError.missingSession }
-
-        var queryItems = [URLQueryItem(name: "connectors", value: profile.connectors.map(\.rawValue).joined(separator: ","))]
-        if let minimumPowerKW = profile.minimumPowerKW {
-            queryItems.append(URLQueryItem(name: "minimumPowerKW", value: String(minimumPowerKW)))
-        }
+        _ = profile // Catalog is cached once; compatibility is applied locally for every saved vehicle.
         let response: StationFetchResult = try await request(
             path: "functions/v1/stations",
             method: "GET",
-            queryItems: queryItems,
             session: session
         )
         return response
     }
 
-    func loadProfile(session: UserSession) async throws -> VehicleProfile? {
+    func createPrivateSite(id: UUID, station: ChargingStation, invitedEmail: String?, session: UserSession) async throws {
+        struct RequestBody: Encodable {
+            let pID: UUID
+            let pStation: ChargingStation
+            let pOwnerConsent: Bool
+            let pInvitedEmail: String?
+
+            enum CodingKeys: String, CodingKey {
+                case pID = "p_id"
+                case pStation = "p_station"
+                case pOwnerConsent = "p_owner_consent"
+                case pInvitedEmail = "p_invited_email"
+            }
+        }
+        let _: String = try await request(
+            path: "rest/v1/rpc/create_private_charger_site",
+            method: "POST",
+            body: RequestBody(pID: id, pStation: station, pOwnerConsent: true, pInvitedEmail: invitedEmail),
+            session: session
+        )
+    }
+
+    func loadProfiles(session: UserSession) async throws -> [VehicleProfile] {
         let profiles: [VehicleProfile] = try await request(
             path: "rest/v1/vehicle_profiles",
             method: "GET",
@@ -148,7 +178,16 @@ actor BackendClient {
             ],
             session: session
         )
-        return profiles.first
+        return profiles
+    }
+
+    func loadActiveVehicleID(session: UserSession) async throws -> UUID? {
+        let preferences: [ActiveVehiclePreference] = try await request(
+            path: "rest/v1/user_preferences", method: "GET",
+            queryItems: [URLQueryItem(name: "user_id", value: "eq.\(session.userID)"), URLQueryItem(name: "select", value: "*")],
+            session: session
+        )
+        return preferences.first?.activeVehicleID
     }
 
     func saveProfile(_ profile: VehicleProfile, session: UserSession) async throws {
@@ -158,10 +197,28 @@ actor BackendClient {
         let _: EmptyResponse = try await request(
             path: "rest/v1/vehicle_profiles",
             method: "POST",
-            queryItems: [URLQueryItem(name: "on_conflict", value: "user_id")],
+            queryItems: [URLQueryItem(name: "on_conflict", value: "id")],
             body: payload,
             session: session,
             additionalHeaders: ["Prefer": "resolution=merge-duplicates,return=minimal"]
+        )
+    }
+
+    func setActiveVehicle(_ id: UUID?, session: UserSession) async throws {
+        let _: EmptyResponse = try await request(
+            path: "rest/v1/user_preferences", method: "POST",
+            queryItems: [URLQueryItem(name: "on_conflict", value: "user_id")],
+            body: ActiveVehiclePreference(userID: session.userID, activeVehicleID: id), session: session,
+            additionalHeaders: ["Prefer": "resolution=merge-duplicates,return=minimal"]
+        )
+    }
+
+    func deleteProfile(_ id: UUID, session: UserSession) async throws {
+        let _: EmptyResponse = try await request(
+            path: "rest/v1/vehicle_profiles", method: "DELETE",
+            queryItems: [URLQueryItem(name: "user_id", value: "eq.\(session.userID)"),
+                         URLQueryItem(name: "id", value: "eq.\(id.uuidString.lowercased())")],
+            session: session
         )
     }
 

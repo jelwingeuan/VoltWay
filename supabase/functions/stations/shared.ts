@@ -14,8 +14,25 @@ export type Station = {
     lastUpdated: string | null;
   };
   price: { amountMYR: number; unit: string; lastUpdated: string | null } | null;
-  source: "gentari" | "openChargeMap";
+  source: "gentari" | "openChargeMap" | "ownerProvided";
+  sourceAttribution?: string;
+  access?: "public" | "limited" | "unknown";
+  chargePointCount?: number | null;
 };
+
+// These licenses are explicitly permitted for redistribution with the attribution below.
+// Unknown or ambiguous provider terms remain excluded and appear in the import report.
+const approvedLicenses = new Map([
+  ["cc0", "CC0"],
+  ["cc-0", "CC0"],
+  ["licensed under cc0 by data sharing agreement", "CC0"],
+  ["cc by 4.0", "CC BY 4.0"],
+  ["licensed under creative commons attribution 4.0 international (cc by 4.0)", "CC BY 4.0"],
+]);
+const providerFallbacks = new Map([
+  [1, "Open Charge Map · CC BY 4.0"],
+  [41, "ChargeSini via Open Charge Map · CC0"],
+]);
 
 export function stationArray(payload: unknown): JSONObject[] {
   if (Array.isArray(payload)) return payload.filter(isObject);
@@ -67,23 +84,85 @@ export function normalizeGentari(raw: JSONObject): Station | null {
       lastUpdated: isoDate(pricePayload?.last_updated ?? pricePayload?.updated_at),
     } : null,
     source: "gentari",
+    chargePointCount: positiveInteger(raw.number_of_points ?? raw.charge_point_count),
   };
 }
 
 export function normalizeOpenChargeMap(raw: JSONObject): Station | null {
+  return classifyOpenChargeMap(raw).station;
+}
+
+export function normalizePrivateSite(raw: JSONObject): Station | null {
+  const supplied = isObject(raw.station) ? raw.station : null;
+  const coordinate = supplied && isObject(supplied.coordinate) ? supplied.coordinate : null;
+  const latitude = number(coordinate?.latitude);
+  const longitude = number(coordinate?.longitude);
+  const id = text(raw.id);
+  const name = text(supplied?.name);
+  if (!id || !name || name.length > 100 || !validCoordinate(latitude, longitude) ||
+      latitude < 0.8 || latitude > 7.5 || longitude! < 99 || longitude! > 120.5) return null;
+  const suppliedConnectors = Array.isArray(supplied?.connectors) ? supplied.connectors.filter(isObject) : [];
+  const connectors = suppliedConnectors.flatMap((connector) => {
+    const kind = normalizeConnector(text(connector.kind));
+    if (!kind) return [];
+    return [{
+      kind,
+      powerKW: positive(number(connector.powerKW)),
+      count: positiveInteger(connector.count),
+    }];
+  });
+  if (!connectors.length) return null;
+  return {
+    id: `private:${id}`,
+    name,
+    address: text(supplied?.address)?.slice(0, 240) ?? "Address unavailable",
+    coordinate: { latitude, longitude: longitude! },
+    operatorName: text(supplied?.operatorName)?.slice(0, 100) ?? "Private charger",
+    connectors,
+    availability: { state: "unknown", availableConnectors: null, totalConnectors: null, lastUpdated: null },
+    price: null,
+    source: "ownerProvided",
+    sourceAttribution: "Owner supplied · shared by invitation",
+    access: "private",
+    chargePointCount: positiveInteger(supplied?.chargePointCount),
+  };
+}
+
+export function classifyOpenChargeMap(raw: JSONObject): {
+  station: Station | null; excluded: "license" | "private" | "invalid" | null; providerID: number | null;
+} {
   const provider = isObject(raw.DataProvider) ? raw.DataProvider : null;
-  // ponytail: only contributor data has a known compatible license; review provider IDs before widening this gate.
-  if (number(provider?.ID ?? raw.DataProviderID) !== 1) return null;
+  const providerID = number(provider?.ID ?? raw.DataProviderID);
+  const usage = isObject(raw.UsageType) ? raw.UsageType : null;
+  const usageID = number(raw.UsageTypeID ?? usage?.ID);
+  const usageTitle = text(usage?.Title)?.toLowerCase() ?? "";
+  if ([2, 3, 6].includes(usageID ?? -1) || usageTitle.startsWith("private") || usageTitle.startsWith("privately owned")) {
+    return { station: null, excluded: "private", providerID };
+  }
+  const license = text(provider?.License)?.toLowerCase().replaceAll(/\s+/g, " ");
+  const approvedLicense = license ? approvedLicenses.get(license) : null;
+  const knownProvider = providerID === 1 || providerID === 41;
+  const attribution = provider && approvedLicense && provider.IsOpenDataLicensed !== false &&
+    (provider.IsOpenDataLicensed === true || knownProvider) && provider.IsApprovedImport !== false
+    ? (providerID === 1 && approvedLicense === "CC BY 4.0") || (providerID === 41 && approvedLicense === "CC0")
+      ? providerFallbacks.get(providerID)
+      : `${text(provider.Title) ?? `Provider ${providerID ?? "unknown"}`} via Open Charge Map · ${approvedLicense}`
+    : !provider && providerID !== null ? providerFallbacks.get(providerID) : null;
+  if (!attribution) return { station: null, excluded: "license", providerID };
   const id = positiveInteger(raw.ID);
   const address = isObject(raw.AddressInfo) ? raw.AddressInfo : null;
   const country = isObject(address?.Country) ? address.Country : null;
   const countryCode = text(country?.ISOCode);
+  const countryID = number(address?.CountryID);
   const latitude = number(address?.Latitude);
   const longitude = number(address?.Longitude);
-  if (!id || !validCoordinate(latitude, longitude) || (countryCode ? countryCode !== "MY" : number(address?.CountryID) !== 137) ||
-      latitude < 0.8 || latitude > 7.5 || longitude! < 99 || longitude! > 120.5) return null;
+  if (!id || !validCoordinate(latitude, longitude) || (countryCode !== null && countryCode !== "MY") ||
+      (countryID !== null && countryID !== 137) ||
+      latitude < 0.8 || latitude > 7.5 || longitude! < 99 || longitude! > 120.5) {
+    return { station: null, excluded: "invalid", providerID };
+  }
   const name = text(address?.Title);
-  if (!name) return null;
+  if (!name) return { station: null, excluded: "invalid", providerID };
 
   const connections = Array.isArray(raw.Connections) ? raw.Connections.filter(isObject) : [];
   const connectors = connections.flatMap((connection) => {
@@ -92,12 +171,13 @@ export function normalizeOpenChargeMap(raw: JSONObject): Station | null {
     if (!kind) return [];
     return [{ kind, powerKW: positive(number(connection.PowerKW)), count: positiveInteger(connection.Quantity) }];
   });
-  if (!connectors.length) return null;
-
   const operator = isObject(raw.OperatorInfo) ? raw.OperatorInfo : null;
   const addressParts = [address?.AddressLine1, address?.Town, address?.StateOrProvince]
     .map(text).filter((part): part is string => part !== null);
-  return {
+  const access = usageID === 4 || usageID === 7 || usageTitle.includes("membership") || usageTitle.includes("notice required")
+    ? "limited" : [1, 5].includes(usageID ?? -1) || usageTitle === "public" || usageTitle.includes("pay at location")
+    ? "public" : "unknown";
+  return { station: {
     id: `ocm:${id}`,
     name,
     address: addressParts.join(", ") || "Address unavailable",
@@ -108,30 +188,46 @@ export function normalizeOpenChargeMap(raw: JSONObject): Station | null {
     availability: { state: "unknown", availableConnectors: null, totalConnectors: null, lastUpdated: null },
     price: null,
     source: "openChargeMap",
-  };
+    sourceAttribution: attribution,
+    access,
+    chargePointCount: positiveInteger(raw.NumberOfPoints),
+  }, excluded: null, providerID };
 }
 
 export function mergeStations(gentari: Station[], openChargeMap: Station[]): Station[] {
+  return mergeWithDuplicateIDs(gentari, openChargeMap).stations;
+}
+
+function mergeWithDuplicateIDs(gentari: Station[], openChargeMap: Station[]): { stations: Station[]; duplicateIDs: string[] } {
   // ponytail: exact-name/100 m matching avoids false merges; add a shared site ID if a partner feed supplies one.
-  return [...gentari, ...openChargeMap.filter((openStation) => !gentari.some((partnerStation) =>
+  const duplicateIDs: string[] = [];
+  const distinctDirectory = openChargeMap.filter((openStation) => {
+    const duplicate = gentari.some((partnerStation) =>
     partnerStation.id === openStation.id ||
     (sameName(openStation.name, partnerStation.name) && distanceMeters(openStation.coordinate, partnerStation.coordinate) <= 100)
-  ))];
+    );
+    if (duplicate) duplicateIDs.push(openStation.id);
+    return !duplicate;
+  });
+  return { stations: [...gentari, ...distinctDirectory], duplicateIDs };
 }
 
 export function combineSources(gentari: Station[] | null, openChargeMap: Station[] | null): {
   stations: Station[];
   warnings: string[];
+  duplicateCount: number;
+  duplicateIDs: string[];
 } | null {
   if (gentari === null && openChargeMap === null) return null;
   const warnings: string[] = [];
   if (gentari === null) warnings.push("Gentari live feed unavailable; showing open-data locations only.");
   if (openChargeMap === null) warnings.push("Open Charge Map catalog unavailable; showing Gentari locations only.");
-  return { stations: mergeStations(gentari ?? [], openChargeMap ?? []), warnings };
+  const { stations, duplicateIDs } = mergeWithDuplicateIDs(gentari ?? [], openChargeMap ?? []);
+  return { stations, warnings, duplicateCount: duplicateIDs.length, duplicateIDs };
 }
 
 export function filterStations(stations: Station[], connectors: Set<string>, minimumPower: number): Station[] {
-  return stations.filter((station) => station.connectors.some((connector) =>
+  return stations.filter((station) => (!connectors.size && minimumPower <= 0) || station.connectors.some((connector) =>
     (!connectors.size || connectors.has(connector.kind)) &&
     (minimumPower <= 0 || (connector.powerKW !== null && connector.powerKW >= minimumPower))
   ));
