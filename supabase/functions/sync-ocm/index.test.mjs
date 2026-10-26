@@ -143,6 +143,7 @@ test("Import accounts for every fetched record without silently losing unknown c
       { ...base, ID: 2, DataProviderID: 9 },
       { ...base, ID: 3, UsageType: { Title: "Private - For Staff Only", IsPublicAccess: false } },
       { ...base, ID: 4, AddressInfo: { ...base.AddressInfo, Latitude: 40 } },
+      { ...base, ID: 5, UsageType: { Title: "Staff only", IsPublicAccess: false } },
       ]);
     }
     written = JSON.parse(options.body);
@@ -152,10 +153,10 @@ test("Import accounts for every fetched record without silently losing unknown c
     assert.equal((await handler(request())).status, 200);
     assert.deepEqual(written.stations.map((item) => item.id), ["ocm:1"]);
     assert.deepEqual(written.import_report, {
-      fetched: 4, included: 1, private: 1, invalid: 1, license: 1, providerIDsNeedingReview: [9],
-      excludedIDs: { private: [3], invalid: [4], license: [2] },
+      fetched: 5, included: 1, private: 2, invalid: 1, license: 1, providerIDsNeedingReview: [9],
+      excludedIDs: { private: [3, 5], invalid: [4], license: [2] },
       providers: [
-        { id: 1, name: "Provider 1", fetched: 3, included: 1, private: 1, invalid: 1, license: 0 },
+        { id: 1, name: "Provider 1", fetched: 4, included: 1, private: 2, invalid: 1, license: 0 },
         { id: 9, name: "Provider 9", fetched: 1, included: 0, private: 0, invalid: 0, license: 1 },
       ],
     });

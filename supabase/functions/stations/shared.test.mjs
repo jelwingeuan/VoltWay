@@ -97,6 +97,21 @@ test("a proposed planning row cannot hide a live charger at the same named site"
   assert.equal(result.stations[1].availability.state, "unknown");
 });
 
+test("OCM enriches a matching Gentari site without replacing partner connector facts", () => {
+  const partner = normalizeGentari({ id: "partner-site", name: "City Mall", latitude: 3.14, longitude: 101.68,
+    connectors: [{ kind: "CCS2", powerKW: 150, count: 1 }] });
+  const directory = normalizeOpenChargeMap(ocm({ UsageType: { ID: 1, Title: "Public", IsPublicAccess: true } }));
+  const merged = combineNationwide([partner], [directory], null).stations;
+  assert.equal(merged.length, 1);
+  assert.equal(merged[0].id, "partner-site");
+  assert.equal(merged[0].access, "public");
+  assert.deepEqual(merged[0].connectors, [
+    { kind: "ccs2", powerKW: 150, count: 1 },
+    { kind: "type2", powerKW: null, count: null },
+  ]);
+  assert.deepEqual(filterStations(merged, new Set(["type2"]), 0).map((station) => station.id), ["partner-site"]);
+});
+
 test("OCM imports contributor locations but never directory status or price", () => {
   const station = normalizeOpenChargeMap(ocm());
   assert.equal(station.id, "ocm:42");
@@ -115,6 +130,7 @@ test("OCM explains exclusions and keeps unknown connectors in the directory", ()
   assert.deepEqual(normalizeOpenChargeMap(ocm({ Connections: [{ ConnectionTypeID: 1 }] }))?.connectors, []);
   assert.equal(classifyOpenChargeMap(ocm({ DataProviderID: 9, DataProvider: undefined })).excluded, "license");
   assert.equal(classifyOpenChargeMap(ocm({ UsageType: { Title: "Private - For Staff Only", IsPublicAccess: false } })).excluded, "private");
+  assert.equal(classifyOpenChargeMap(ocm({ UsageType: { Title: "Staff only", IsPublicAccess: false } })).excluded, "private");
   assert.equal(classifyOpenChargeMap(ocm({ UsageTypeID: 3, UsageType: undefined })).excluded, "private");
   assert.equal(classifyOpenChargeMap(ocm({ DataProviderID: 9, DataProvider: undefined, UsageTypeID: 2 })).excluded, "private");
   assert.equal(classifyOpenChargeMap(ocm({ AddressInfo: { ...ocm().AddressInfo, Latitude: 40 } })).excluded, "invalid");

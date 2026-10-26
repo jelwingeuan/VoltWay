@@ -566,6 +566,51 @@ struct BackendClientTests {
         #expect(store.lastSuccessfulStationFetchAt == nil)
     }
 
+    @Test("A charger response arriving after sign-out cannot restore account data")
+    @MainActor func staleRefreshAfterSignOut() async throws {
+        let stationRequests = LockedCounter()
+        let releaseRefresh = DispatchSemaphore(value: 0)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let stationList = try encoder.encode([DemoData.stations[0]])
+        let staleResponse = Data(#"{"stations": "#.utf8) + stationList + Data("}".utf8)
+        MockURLProtocol.handler = { request in
+            switch request.url?.path {
+            case "/auth/v1/token":
+                return (200, Data(#"{"access_token":"fresh","refresh_token":"refresh-1","user":{"id":"user-1","email":"driver@example.com"}}"#.utf8))
+            case "/functions/v1/stations":
+                stationRequests.increment()
+                if stationRequests.value == 2 {
+                    releaseRefresh.wait()
+                    return (200, staleResponse)
+                }
+                return (200, Data(#"{"stations":[]}"#.utf8))
+            default:
+                return (200, Data("[]".utf8))
+            }
+        }
+        defer {
+            releaseRefresh.signal()
+            MockURLProtocol.handler = nil
+        }
+
+        let store = VoltWayStore(configuration: configuration, backend: makeClient(account: "test-\(UUID().uuidString)"))
+        await store.signIn(email: "driver@example.com", password: "password-123")
+        let refresh = Task { await store.refreshStations() }
+        for _ in 0..<100 where stationRequests.value < 2 {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(stationRequests.value == 2)
+        await store.signOut()
+        releaseRefresh.signal()
+        await refresh.value
+
+        #expect(store.session == nil)
+        #expect(store.stations.isEmpty)
+        #expect(store.lastSuccessfulStationFetchAt == nil)
+        #expect(CarPlaySnapshotStore.load().stations.isEmpty)
+    }
+
     @Test("Changing the vehicle keeps the catalog snapshot and list-check time")
     @MainActor func profileChangeInvalidatesFetchTime() async throws {
         let stationRequests = LockedCounter()
@@ -738,6 +783,39 @@ struct BackendClientTests {
         #expect(restored?.accessToken == "fresh")
         #expect(restored?.refreshToken == "refresh-2")
         try await client.signOut()
+    }
+
+    @Test("A sign-in response arriving after sign-out cannot save a session")
+    func lateSignInAfterSignOut() async throws {
+        let authRequests = LockedCounter()
+        let releaseSignIn = DispatchSemaphore(value: 0)
+        MockURLProtocol.handler = { request in
+            guard request.url?.path == "/auth/v1/token" else { return (404, Data()) }
+            authRequests.increment()
+            releaseSignIn.wait()
+            return (200, Data(#"{"access_token":"late","refresh_token":"late-refresh","user":{"id":"user-1","email":"driver@example.com"}}"#.utf8))
+        }
+        defer {
+            releaseSignIn.signal()
+            MockURLProtocol.handler = nil
+        }
+
+        let client = makeClient(account: "test-\(UUID().uuidString)")
+        let signIn = Task { try await client.signIn(email: "driver@example.com", password: "password-123") }
+        for _ in 0..<100 where authRequests.value == 0 {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(authRequests.value == 1)
+        try await client.signOut()
+        releaseSignIn.signal()
+        do {
+            _ = try await signIn.value
+            Issue.record("A signed-out account accepted a late sign-in response")
+        } catch {
+            #expect(error as? BackendError == .missingSession)
+        }
+        let restored = try await client.restoreSession()
+        #expect(restored == nil)
     }
 
     @Test("Charger catalog request sends no vehicle or location filters")

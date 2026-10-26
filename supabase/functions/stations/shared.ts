@@ -207,7 +207,8 @@ export function classifyOpenChargeMap(raw: JSONObject): {
   const usage = isObject(raw.UsageType) ? raw.UsageType : null;
   const usageID = number(raw.UsageTypeID ?? usage?.ID);
   const usageTitle = text(usage?.Title)?.toLowerCase() ?? "";
-  if ([2, 3, 6].includes(usageID ?? -1) || usageTitle.startsWith("private") || usageTitle.startsWith("privately owned")) {
+  if (usage?.IsPublicAccess === false || [2, 3, 6].includes(usageID ?? -1) ||
+      usageTitle.startsWith("private") || usageTitle.startsWith("privately owned")) {
     return { station: null, excluded: "private", providerID };
   }
   const license = text(provider?.License)?.toLowerCase().replaceAll(/\s+/g, " ");
@@ -332,7 +333,8 @@ export function combineNationwide(gentari: Station[] | null, openChargeMap: Stat
     // Source order is Gentari, OCM, MEVnet. Preserve the first stable ID and all trusted enriched facts.
     stations[index] = { ...existing, sourceIDs, sourceAttributions,
       sourceAttribution: sourceAttributions.join(" · "),
-      connectors: existing.connectors.length ? existing.connectors : incoming.connectors,
+      connectors: [...existing.connectors, ...incoming.connectors.filter((connector) =>
+        !existing.connectors.some((current) => current.kind === connector.kind))],
       address: existing.address !== "Address unavailable" ? existing.address : incoming.address,
       state: incoming.source === "mevnet" ? incoming.state : existing.state,
       sourceSequence: incoming.source === "mevnet" ? incoming.sourceSequence : existing.sourceSequence,
@@ -350,7 +352,7 @@ export function combineNationwide(gentari: Station[] | null, openChargeMap: Stat
       networkCounts: incoming.source === "mevnet" ? incoming.networkCounts : existing.networkCounts,
       chargePointCount: incoming.source === "mevnet" && incoming.chargePointCount !== null ? incoming.chargePointCount : existing.chargePointCount,
       sourceUpdatedAt: incoming.source === "mevnet" ? incoming.sourceUpdatedAt : existing.sourceUpdatedAt,
-      access: existing.access === "unknown" ? incoming.access : existing.access,
+      access: existing.access && existing.access !== "unknown" ? existing.access : incoming.access ?? existing.access,
     };
     if (!(byName.get(siteName(incoming.name)) ?? []).includes(index)) {
       byName.set(siteName(incoming.name), [...(byName.get(siteName(incoming.name)) ?? []), index]);

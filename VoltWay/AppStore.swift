@@ -28,6 +28,9 @@ final class VoltWayStore {
     @ObservationIgnored private let backend: BackendClient
     @ObservationIgnored private let locationService: LocationService
     @ObservationIgnored private var didBootstrap = false
+    @ObservationIgnored private var accountRevision = 0
+    @ObservationIgnored private var stationRefreshRevision = 0
+    @ObservationIgnored private var isSigningOut = false
 
     init(configuration: AppConfiguration = .current, backend: BackendClient? = nil) {
         self.backend = backend ?? BackendClient(configuration: configuration)
@@ -73,14 +76,18 @@ final class VoltWayStore {
             return
         }
 
+        let revision = accountRevision
         do {
-            session = try await backend.restoreSession()
+            let restored = try await backend.restoreSession()
+            guard accountRevision == revision else { return }
+            session = restored
             if session != nil {
                 try await loadAccountData()
             } else {
                 CarPlaySnapshotStore.clear()
             }
         } catch {
+            guard accountRevision == revision else { return }
             if session == nil { CarPlaySnapshotStore.clear() }
             show(error)
         }
@@ -91,14 +98,19 @@ final class VoltWayStore {
             errorMessage = "Enter a valid email and a password with at least 8 characters."
             return
         }
+        guard !isAuthenticating, !isSigningOut else { return }
 
+        let revision = accountRevision
         isAuthenticating = true
         defer { isAuthenticating = false }
         do {
-            session = try await backend.signIn(email: email, password: password)
+            let signedIn = try await backend.signIn(email: email, password: password)
+            guard accountRevision == revision else { return }
+            accountRevision += 1
+            session = signedIn
             try await loadAccountData()
         } catch {
-            show(error)
+            if accountRevision == revision { show(error) }
         }
     }
 
@@ -107,18 +119,23 @@ final class VoltWayStore {
             errorMessage = "Enter a valid email and a password with at least 8 characters."
             return
         }
+        guard !isAuthenticating, !isSigningOut else { return }
 
+        let revision = accountRevision
         isAuthenticating = true
         defer { isAuthenticating = false }
         do {
-            session = try await backend.signUp(email: email, password: password)
-            if session != nil {
+            let signedUp = try await backend.signUp(email: email, password: password)
+            guard accountRevision == revision else { return }
+            if let signedUp {
+                accountRevision += 1
+                session = signedUp
                 try await loadAccountData()
             } else {
                 noticeMessage = "Check your email to confirm your VoltWay account, then sign in."
             }
         } catch {
-            show(error)
+            if accountRevision == revision { show(error) }
         }
     }
 
@@ -136,33 +153,52 @@ final class VoltWayStore {
     }
 
     func signOut() async {
+        guard !isSigningOut else { return }
+        isSigningOut = true
+        accountRevision += 1
+        let revision = accountRevision
+        isAuthenticating = true
+        defer {
+            isSigningOut = false
+            isAuthenticating = false
+        }
+        session = nil
+        stations = []
+        vehicles = []
+        activeVehicleID = nil
+        profile = VehicleProfile(connectors: [], minimumPowerKW: nil)
+        favorites = []
+        currentLocation = nil
+        lastSuccessfulStationFetchAt = nil
+        catalogSyncedAt = nil
+        catalogImportReport = nil
+        mevnetSyncedAt = nil
+        mevnetImportReport = nil
+        duplicateCount = 0
+        sourceWarnings = []
+        isLoadingStations = false
+        CarPlaySnapshotStore.clear()
         do {
             try await backend.signOut()
-            session = nil
-            stations = []
-            vehicles = []
-            activeVehicleID = nil
-            profile = VehicleProfile(connectors: [], minimumPowerKW: nil)
-            favorites = []
-            currentLocation = nil
-            lastSuccessfulStationFetchAt = nil
-            catalogSyncedAt = nil
-            catalogImportReport = nil
-            mevnetSyncedAt = nil
-            mevnetImportReport = nil
-            duplicateCount = 0
-            sourceWarnings = []
-            CarPlaySnapshotStore.clear()
         } catch {
-            show(error)
+            if accountRevision == revision { show(error) }
         }
     }
 
     func refreshStations() async {
+        guard isDemoMode || session != nil else { return }
+        stationRefreshRevision += 1
+        let refreshRevision = stationRefreshRevision
+        let accountRevision = accountRevision
+        let requestedSession = session
         isLoadingStations = true
-        defer { isLoadingStations = false }
+        defer {
+            if stationRefreshRevision == refreshRevision { isLoadingStations = false }
+        }
         do {
-            let result = try await backend.stations(profile: profile, session: session)
+            let result = try await backend.stations(profile: profile, session: requestedSession)
+            guard isCurrentAccount(accountRevision, userID: requestedSession?.userID),
+                  stationRefreshRevision == refreshRevision else { return }
             stations = result.stations
             sourceWarnings = result.warnings ?? []
             catalogSyncedAt = result.catalogSyncedAt
@@ -174,7 +210,8 @@ final class VoltWayStore {
             errorMessage = nil
             persistCarPlaySnapshot()
         } catch {
-            show(error)
+            if isCurrentAccount(accountRevision, userID: requestedSession?.userID),
+               stationRefreshRevision == refreshRevision { show(error) }
         }
     }
 
@@ -217,6 +254,7 @@ final class VoltWayStore {
         }
 
         let id = UUID()
+        let accountRevision = accountRevision
         let station = ChargingStation(
             id: "private:\(id.uuidString.lowercased())",
             name: cleanName,
@@ -238,25 +276,30 @@ final class VoltWayStore {
                 invitedEmail: cleanEmail.isEmpty ? nil : cleanEmail,
                 session: session
             )
+            guard isCurrentAccount(accountRevision, userID: session.userID) else { return false }
             await refreshStations()
+            guard isCurrentAccount(accountRevision, userID: session.userID) else { return false }
             noticeMessage = cleanEmail.isEmpty
                 ? "Private charger saved for your account."
                 : "Private charger saved and shared with the invited account."
             return true
         } catch {
-            show(error)
+            if isCurrentAccount(accountRevision, userID: session.userID) { show(error) }
             return false
         }
     }
 
     @discardableResult
     func useCurrentLocation() async -> Coordinate? {
+        let accountRevision = accountRevision
+        let userID = session?.userID
         do {
             let location = try await locationService.requestLocation()
+            guard isCurrentAccount(accountRevision, userID: userID) else { return nil }
             currentLocation = location
             return location
         } catch {
-            show(error)
+            if isCurrentAccount(accountRevision, userID: userID) { show(error) }
             return nil
         }
     }
@@ -286,11 +329,13 @@ final class VoltWayStore {
             minimumPowerKW: minimumPowerKW,
             updatedAt: .now
         )
+        let accountRevision = accountRevision
         do {
             if let session {
                 try await backend.saveProfile(updated, session: session)
                 if createsNew || vehicles.isEmpty { try await backend.setActiveVehicle(updated.id, session: session) }
             }
+            guard isCurrentAccount(accountRevision, userID: session?.userID) else { return false }
             if let index = vehicles.firstIndex(where: { $0.id == updated.id }) { vehicles[index] = updated }
             else { vehicles.append(updated) }
             if createsNew || previous?.id == activeVehicleID || activeVehicleID == nil {
@@ -301,25 +346,33 @@ final class VoltWayStore {
             errorMessage = nil
             return true
         } catch {
-            show(error)
+            if isCurrentAccount(accountRevision, userID: session?.userID) { show(error) }
             return false
         }
     }
 
     func selectVehicle(_ vehicle: VehicleProfile) async {
         guard vehicles.contains(where: { $0.id == vehicle.id }) else { return }
+        let accountRevision = accountRevision
+        let userID = session?.userID
         do {
             if let session { try await backend.setActiveVehicle(vehicle.id, session: session) }
+            guard isCurrentAccount(accountRevision, userID: userID) else { return }
             activeVehicleID = vehicle.id
             profile = vehicle
             persistCarPlaySnapshot()
-        } catch { show(error) }
+        } catch {
+            if isCurrentAccount(accountRevision, userID: userID) { show(error) }
+        }
     }
 
     func deleteVehicle(_ vehicle: VehicleProfile) async {
         guard vehicles.contains(where: { $0.id == vehicle.id }) else { return }
+        let accountRevision = accountRevision
+        let userID = session?.userID
         do {
             if let session { try await backend.deleteProfile(vehicle.id, session: session) }
+            guard isCurrentAccount(accountRevision, userID: userID) else { return }
             vehicles.removeAll { $0.id == vehicle.id }
             let deletedActiveVehicle = activeVehicleID == vehicle.id
             if deletedActiveVehicle {
@@ -329,10 +382,14 @@ final class VoltWayStore {
             }
             persistCarPlaySnapshot()
             if deletedActiveVehicle, let session { try await backend.setActiveVehicle(activeVehicleID, session: session) }
-        } catch { show(error) }
+        } catch {
+            if isCurrentAccount(accountRevision, userID: userID) { show(error) }
+        }
     }
 
     func toggleFavorite(_ station: ChargingStation) async {
+        let accountRevision = accountRevision
+        let userID = session?.userID
         let previous = favorites
         if favoriteStationIDs.contains(station.id) {
             favorites.removeAll { $0.stationID == station.id }
@@ -349,6 +406,7 @@ final class VoltWayStore {
                 try await backend.saveFavorite(station, session: session)
             }
         } catch {
+            guard isCurrentAccount(accountRevision, userID: userID) else { return }
             favorites = previous
             persistCarPlaySnapshot()
             show(error)
@@ -366,16 +424,24 @@ final class VoltWayStore {
 
     private func loadAccountData() async throws {
         guard let session else { return }
+        let accountRevision = accountRevision
         async let loadedProfiles = backend.loadProfiles(session: session)
         async let loadedActiveID = backend.loadActiveVehicleID(session: session)
         async let loadedFavorites = backend.loadFavorites(session: session)
-        vehicles = try await loadedProfiles.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        let profiles = try await loadedProfiles.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
         let selectedID = try await loadedActiveID
-        let selected = vehicles.first(where: { $0.id == selectedID }) ?? vehicles.first
+        let loadedFavoritesResult = try await loadedFavorites
+        guard isCurrentAccount(accountRevision, userID: session.userID) else { return }
+        vehicles = profiles
+        let selected = profiles.first(where: { $0.id == selectedID }) ?? profiles.first
         activeVehicleID = selected?.id
         profile = selected ?? VehicleProfile(userID: session.userID, connectors: [], minimumPowerKW: nil)
-        favorites = try await loadedFavorites
+        favorites = loadedFavoritesResult
         await refreshStations()
+    }
+
+    private func isCurrentAccount(_ revision: Int, userID: String?) -> Bool {
+        accountRevision == revision && session?.userID == userID
     }
 
     private func persistCarPlaySnapshot() {

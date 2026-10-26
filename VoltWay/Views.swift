@@ -732,13 +732,26 @@ private struct ChargerMapView: UIViewRepresentable {
             (annotation as? ChargerAnnotation).map { ($0.stationID, $0) }
         }, uniquingKeysWith: { first, _ in first })
         let incoming = Set(uniqueStations.map(\.id))
-        map.removeAnnotations(current.values.filter { !incoming.contains($0.stationID) })
-        let additions = uniqueStations.filter { current[$0.id] == nil }.map {
+        let changedIDs = Set(uniqueStations.compactMap { station -> String? in
+            guard let annotation = current[station.id] else { return nil }
+            let coordinate = station.coordinate.coreLocation.coordinate
+            return annotation.coordinate.latitude != coordinate.latitude
+                || annotation.coordinate.longitude != coordinate.longitude
+                || annotation.title != station.networkName
+                || annotation.isProposed != (station.lifecycle == .proposed) ? station.id : nil
+        })
+        let selectedReplacementID = map.selectedAnnotations.compactMap { ($0 as? ChargerAnnotation)?.stationID }
+            .first { changedIDs.contains($0) }
+        map.removeAnnotations(current.values.filter { !incoming.contains($0.stationID) || changedIDs.contains($0.stationID) })
+        let additions = uniqueStations.filter { current[$0.id] == nil || changedIDs.contains($0.id) }.map {
             ChargerAnnotation(station: $0, isAvailable: $0.availability.isReportedAvailable(at: freshnessTime))
         }
         map.addAnnotations(additions)
+        if let selectedReplacementID, let replacement = additions.first(where: { $0.stationID == selectedReplacementID }) {
+            map.selectAnnotation(replacement, animated: false)
+        }
         for station in uniqueStations {
-            guard let annotation = current[station.id] else { continue }
+            guard let annotation = current[station.id], !changedIDs.contains(station.id) else { continue }
             let isAvailable = station.availability.isReportedAvailable(at: freshnessTime)
             guard annotation.isAvailable != isAvailable else { continue }
             annotation.isAvailable = isAvailable

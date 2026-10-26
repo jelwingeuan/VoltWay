@@ -67,6 +67,7 @@ actor BackendClient {
     private let credentialAccount: String
     private var currentSession: UserSession?
     private var refreshTask: Task<UserSession, any Error>?
+    private var authRevision = 0
 
     init(configuration: AppConfiguration = .current, urlSession: URLSession = .shared, credentialAccount: String = "supabase-session") {
         self.configuration = configuration
@@ -103,23 +104,29 @@ actor BackendClient {
     }
 
     func signUp(email: String, password: String) async throws -> UserSession? {
+        authRevision += 1
+        let revision = authRevision
         let response: AuthResponse = try await request(
             path: "auth/v1/signup",
             method: "POST",
             body: AuthRequest(email: email, password: password)
         )
+        guard authRevision == revision else { throw BackendError.missingSession }
         guard let session = response.session(fallbackEmail: email) else { return nil }
         try save(session)
         return session
     }
 
     func signIn(email: String, password: String) async throws -> UserSession {
+        authRevision += 1
+        let revision = authRevision
         let response: AuthResponse = try await request(
             path: "auth/v1/token",
             method: "POST",
             queryItems: [URLQueryItem(name: "grant_type", value: "password")],
             body: AuthRequest(email: email, password: password)
         )
+        guard authRevision == revision else { throw BackendError.missingSession }
         guard let session = response.session(fallbackEmail: email) else { throw BackendError.invalidResponse }
         try save(session)
         return session
@@ -134,9 +141,10 @@ actor BackendClient {
     }
 
     func signOut() throws {
-        try KeychainStore.delete(account: credentialAccount)
+        authRevision += 1
         currentSession = nil
         refreshTask = nil
+        try KeychainStore.delete(account: credentialAccount)
     }
 
     func stations(profile: VehicleProfile, session: UserSession?) async throws -> StationFetchResult {
