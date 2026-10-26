@@ -491,18 +491,22 @@ enum StationDiscovery {
         near coordinate: Coordinate?,
         now: Date = .now
     ) -> [ChargingStation] {
-        stations
+        let origin = coordinate?.coreLocation
+        return stations
             .filter { $0.lifecycle != .proposed && profile.accepts($0) }
-            .sorted { lhs, rhs in
-                let lhsRank = lhs.availability.isStale(at: now) ? AvailabilityState.unknown.sortRank : lhs.availability.state.sortRank
-                let rhsRank = rhs.availability.isStale(at: now) ? AvailabilityState.unknown.sortRank : rhs.availability.state.sortRank
-                if lhsRank != rhsRank { return lhsRank < rhsRank }
-
-                let lhsDistance = lhs.distance(from: coordinate) ?? .greatestFiniteMagnitude
-                let rhsDistance = rhs.distance(from: coordinate) ?? .greatestFiniteMagnitude
-                if lhsDistance != rhsDistance { return lhsDistance < rhsDistance }
-                return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+            .map { station in
+                (
+                    station: station,
+                    rank: station.availability.isStale(at: now) ? AvailabilityState.unknown.sortRank : station.availability.state.sortRank,
+                    distance: origin.map { station.coordinate.coreLocation.distance(from: $0) } ?? .greatestFiniteMagnitude
+                )
             }
+            .sorted { lhs, rhs in
+                if lhs.rank != rhs.rank { return lhs.rank < rhs.rank }
+                if lhs.distance != rhs.distance { return lhs.distance < rhs.distance }
+                return lhs.station.name.localizedStandardCompare(rhs.station.name) == .orderedAscending
+            }
+            .map(\.station)
     }
 
     static func visibleStations(

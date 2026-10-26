@@ -5,6 +5,12 @@ import Testing
 struct VoltWayTests {
     private let now = Date(timeIntervalSince1970: 1_800_000_000)
 
+    @Test("Directory-only demo needs no recurring freshness redraw")
+    @MainActor func demoHasNoTimedFacts() {
+        let store = VoltWayStore(configuration: AppConfiguration(supabaseURL: nil, supabaseAnonKey: ""))
+        #expect(store.hasTimedStationFacts == false)
+    }
+
     @Test("Vehicle profile filters connector and charging power")
     func vehicleCompatibility() {
         let profile = VehicleProfile(connectors: [.ccs2], minimumPowerKW: 100)
@@ -682,6 +688,57 @@ struct BackendClientTests {
         #expect(store.profile.name == "Highway EV")
         #expect(store.compatibleStations.map(\.id) == ["ccs-only"])
         #expect(requests.value == 1)
+        await store.signOut()
+    }
+
+    @Test("Compatible order updates when partner availability expires without fetching again")
+    @MainActor func compatibilityFreshnessBoundary() async throws {
+        let now = Date.now
+        let profile = VehicleProfile(userID: "user-1", connectors: [.ccs2], minimumPowerKW: nil)
+        let available = ChargingStation(
+            id: "fresh", name: "Zeta Charger", address: "Malaysia",
+            coordinate: Coordinate(latitude: 3.14, longitude: 101.68), operatorName: "Gentari",
+            connectors: [Connector(kind: .ccs2, powerKW: 150, count: 2)],
+            availability: Availability(state: .available, availableConnectors: 1, totalConnectors: 2,
+                                       lastUpdated: now.addingTimeInterval(-240)), price: nil
+        )
+        let unknown = ChargingStation(
+            id: "unknown", name: "Alpha Charger", address: "Malaysia",
+            coordinate: Coordinate(latitude: 3.15, longitude: 101.69), operatorName: "Gentari",
+            connectors: [Connector(kind: .ccs2, powerKW: 150, count: 2)],
+            availability: Availability(state: .unknown, availableConnectors: nil, totalConnectors: nil,
+                                       lastUpdated: nil), price: nil
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let profiles = try encoder.encode([profile])
+        let stations = Data(#"{"stations": "#.utf8) + (try encoder.encode([unknown, available])) + Data("}".utf8)
+        let stationRequests = LockedCounter()
+        MockURLProtocol.handler = { request in
+            switch request.url?.path {
+            case "/auth/v1/token":
+                return (200, Data(#"{"access_token":"fresh","refresh_token":"refresh-1","user":{"id":"user-1","email":"driver@example.com"}}"#.utf8))
+            case "/rest/v1/vehicle_profiles":
+                return (200, profiles)
+            case "/functions/v1/stations":
+                stationRequests.increment()
+                return (200, stations)
+            default:
+                return (200, Data("[]".utf8))
+            }
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let store = VoltWayStore(configuration: configuration, backend: makeClient(account: "test-\(UUID().uuidString)"))
+        await store.signIn(email: "driver@example.com", password: "password-123")
+        #expect(store.hasTimedStationFacts)
+        #expect(store.compatibleStations.map(\.id) == ["fresh", "unknown"])
+
+        store.refreshAvailabilityOrderingIfNeeded(at: now.addingTimeInterval(30))
+        #expect(store.compatibleStations(at: now.addingTimeInterval(30)).map(\.id) == ["fresh", "unknown"])
+        #expect(store.compatibleStations(at: now.addingTimeInterval(90)).map(\.id) == ["unknown", "fresh"])
+        #expect(store.compatibleStations(at: now.addingTimeInterval(90)).map(\.id) == ["unknown", "fresh"])
+        #expect(stationRequests.value == 1)
         await store.signOut()
     }
 

@@ -191,6 +191,11 @@ struct DiscoverView: View {
         var id: Self { self }
     }
 
+    private struct Results {
+        let stations: [ChargingStation]
+        let networks: [String]
+    }
+
     let store: VoltWayStore
     @State private var showingVehicleProfile = false
     @State private var showingFilters = false
@@ -210,28 +215,29 @@ struct DiscoverView: View {
     @FocusState private var searchIsFocused: Bool
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
-    private var visibleStations: [ChargingStation] {
-        StationDiscovery.visibleStations(
-            from: showAllSites || includeProposed ? store.stations : store.compatibleStations,
-            query: searchText,
-            availableNowOnly: availableNowOnly,
-            network: selectedNetwork,
-            profile: store.profile,
-            showAll: showAllSites,
-            chargingType: chargingType,
-            minimumListedPowerKW: minimumListedPowerKW,
-            access: accessFilter,
-            includeProposed: includeProposed,
-            now: freshnessTime
+    private var results: Results {
+        let candidates = showAllSites || includeProposed ? store.stations : store.compatibleStations
+        return Results(
+            stations: StationDiscovery.visibleStations(
+                from: candidates,
+                query: searchText,
+                availableNowOnly: availableNowOnly,
+                network: selectedNetwork,
+                profile: store.profile,
+                showAll: showAllSites,
+                chargingType: chargingType,
+                minimumListedPowerKW: minimumListedPowerKW,
+                access: accessFilter,
+                includeProposed: includeProposed,
+                now: freshnessTime
+            ),
+            networks: StationDiscovery.networks(from: candidates)
         )
     }
 
-    private var networks: [String] {
-        StationDiscovery.networks(from: showAllSites || includeProposed ? store.stations : store.compatibleStations)
-    }
-
     private var selectedStation: ChargingStation? {
-        visibleStations.first { $0.id == selectedStationID }
+        guard let selectedStationID else { return nil }
+        return store.stations.first { $0.id == selectedStationID }
     }
 
     private var stationSelection: Binding<ChargingStation?> {
@@ -254,10 +260,11 @@ struct DiscoverView: View {
     }
 
     var body: some View {
+        let discoveryResults = results
         Group {
             switch displayMode {
-            case .list: listContent
-            case .map: mapContent
+            case .list: listContent(discoveryResults)
+            case .map: mapContent(discoveryResults)
             }
         }
         .background(Color.voltBackground)
@@ -294,33 +301,42 @@ struct DiscoverView: View {
             guard stationID != nil else { return }
             stationPreviewDetent = dynamicTypeSize.isAccessibilitySize ? .medium : compactStationPreviewDetent
         }
-        .onChange(of: visibleStations.map(\.id)) { _, stationIDs in
+        .onChange(of: discoveryResults.stations.map(\.id)) { _, stationIDs in
             if let selectedStationID, !stationIDs.contains(selectedStationID) {
                 self.selectedStationID = nil
             }
         }
-        .onChange(of: networks) { _, currentNetworks in
+        .onChange(of: discoveryResults.networks) { _, currentNetworks in
             if let selectedNetwork, !currentNetworks.contains(selectedNetwork) {
                 self.selectedNetwork = nil
             }
         }
+        .onChange(of: store.lastSuccessfulStationFetchAt) { _, _ in
+            freshnessTime = .now
+        }
+        .onAppear {
+            freshnessTime = .now
+            store.refreshAvailabilityOrderingIfNeeded(at: freshnessTime)
+        }
         .onReceive(Timer.publish(every: 15, on: .main, in: .common).autoconnect()) { time in
+            guard store.hasTimedStationFacts else { return }
             freshnessTime = time
+            store.refreshAvailabilityOrderingIfNeeded(at: time)
         }
         .task {
             if store.stations.isEmpty { await store.refreshStations() }
         }
     }
 
-    private var listContent: some View {
+    private func listContent(_ results: Results) -> some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 16) {
-                discoveryChrome
+                discoveryChrome(results)
 
-                if hasNoResults {
+                if hasNoResults(in: results.stations) {
                     emptyResults
                 } else {
-                    ForEach(visibleStations) { station in
+                    ForEach(results.stations) { station in
                         Button {
                             selectedStationID = station.id
                         } label: {
@@ -342,17 +358,17 @@ struct DiscoverView: View {
         .refreshable { await store.refreshStations() }
     }
 
-    private var mapContent: some View {
+    private func mapContent(_ results: Results) -> some View {
         ChargerMapView(
-            stations: visibleStations,
+            stations: results.stations,
             freshnessTime: freshnessTime,
             recenterRequest: mapRecenterRequest,
             selectedStationID: $selectedStationID
         )
         .ignoresSafeArea()
-        .safeAreaInset(edge: .top, spacing: 0) { mapChrome }
+        .safeAreaInset(edge: .top, spacing: 0) { mapChrome(results) }
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            if hasNoResults {
+            if hasNoResults(in: results.stations) {
                 emptyResults
                     .padding(.horizontal, 20)
                     .padding(.bottom, 12)
@@ -412,38 +428,38 @@ struct DiscoverView: View {
         .presentationDetents([.medium, .large])
     }
 
-    private var mapChrome: some View {
+    private func mapChrome(_ results: Results) -> some View {
         Group {
             if dynamicTypeSize.isAccessibilitySize {
                 ScrollView {
-                    discoveryChrome
+                    discoveryChrome(results)
                         .padding(.horizontal, 14)
                         .padding(.top, 8)
                 }
                 .scrollIndicators(.hidden)
                 .frame(maxHeight: 340)
             } else {
-                discoveryChrome
+                discoveryChrome(results)
                     .padding(.horizontal, 14)
                     .padding(.top, 8)
             }
         }
     }
 
-    private var discoveryChrome: some View {
+    private func discoveryChrome(_ results: Results) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            discoveryControls
+            discoveryControls(networks: results.networks)
             Group {
                 if store.isDemoMode {
                     ViewThatFits(in: .horizontal) {
                         HStack(spacing: 10) {
                             DemoNotice()
                             Spacer(minLength: 0)
-                            resultsHeader
+                            resultsHeader(results)
                         }
                         VStack(alignment: .leading, spacing: 4) {
                             DemoNotice()
-                            resultsHeader
+                            resultsHeader(results)
                         }
                     }
                     .padding(.horizontal, 13)
@@ -452,7 +468,7 @@ struct DiscoverView: View {
                 } else {
                     VStack(alignment: .leading, spacing: 8) {
                         messages
-                        resultsHeader
+                        resultsHeader(results)
                     }
                     .padding(.horizontal, 12)
                     .padding(.vertical, 9)
@@ -489,9 +505,9 @@ struct DiscoverView: View {
         }
     }
 
-    private var resultsHeader: some View {
+    private func resultsHeader(_ results: Results) -> some View {
         HStack {
-            Text("\(visibleStations.count) sites · \(networks.count) networks")
+            Text("\(results.stations.count) sites · \(results.networks.count) networks")
                 .font(.caption.weight(.semibold))
             if store.isLoadingStations {
                 Spacer()
@@ -500,7 +516,7 @@ struct DiscoverView: View {
         }
     }
 
-    private var discoveryControls: some View {
+    private func discoveryControls(networks: [String]) -> some View {
         GlassEffectContainer(spacing: 8) {
             VStack(spacing: 8) {
                 HStack(spacing: 10) {
@@ -640,7 +656,7 @@ struct DiscoverView: View {
         }
     }
 
-    private var hasNoResults: Bool {
+    private func hasNoResults(in visibleStations: [ChargingStation]) -> Bool {
         (!showAllSites && store.profile.connectors.isEmpty)
             || (!store.isLoadingStations && visibleStations.isEmpty)
     }
@@ -1085,7 +1101,9 @@ struct StationDetailView: View {
                 .accessibilityLabel(isFavorite ? "Remove from favorites" : "Add to favorites")
             }
         }
+        .onAppear { freshnessTime = .now }
         .onReceive(Timer.publish(every: 15, on: .main, in: .common).autoconnect()) { time in
+            guard store.hasTimedStationFacts || station.availability.lastUpdated != nil || station.price?.lastUpdated != nil else { return }
             freshnessTime = time
         }
     }

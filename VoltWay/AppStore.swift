@@ -9,6 +9,7 @@ final class VoltWayStore {
     private(set) var vehicles: [VehicleProfile]
     private(set) var activeVehicleID: UUID?
     private(set) var stations: [ChargingStation]
+    private var compatibleResultRevision = 0
     private(set) var favorites: [FavoriteStation] = []
     private(set) var currentLocation: Coordinate?
     private(set) var lastSuccessfulStationFetchAt: Date?
@@ -31,6 +32,9 @@ final class VoltWayStore {
     @ObservationIgnored private var accountRevision = 0
     @ObservationIgnored private var stationRefreshRevision = 0
     @ObservationIgnored private var isSigningOut = false
+    @ObservationIgnored private var cachedCompatibleStations: [ChargingStation] = []
+    @ObservationIgnored private var compatibleSortDate = Date.distantPast
+    @ObservationIgnored private var nextCompatibleStatusExpiry: Date?
 
     init(configuration: AppConfiguration = .current, backend: BackendClient? = nil) {
         self.backend = backend ?? BackendClient(configuration: configuration)
@@ -40,10 +44,21 @@ final class VoltWayStore {
         vehicles = isDemoMode ? [.demo] : []
         activeVehicleID = isDemoMode ? VehicleProfile.demo.id : nil
         stations = isDemoMode ? DemoData.stations : []
+        rebuildCompatibleStations()
     }
 
     var compatibleStations: [ChargingStation] {
-        StationDiscovery.compatibleStations(from: stations, profile: profile, near: currentLocation)
+        compatibleStations(at: .now)
+    }
+
+    func compatibleStations(at date: Date) -> [ChargingStation] {
+        _ = compatibleResultRevision
+        if needsCompatibleRebuild(at: date) { rebuildCompatibleStations(at: date, notify: false) }
+        return cachedCompatibleStations
+    }
+
+    var hasTimedStationFacts: Bool {
+        stations.contains { $0.availability.lastUpdated != nil || $0.price?.lastUpdated != nil }
     }
 
     var favoriteStationIDs: Set<String> {
@@ -169,6 +184,10 @@ final class VoltWayStore {
         profile = VehicleProfile(connectors: [], minimumPowerKW: nil)
         favorites = []
         currentLocation = nil
+        cachedCompatibleStations = []
+        compatibleSortDate = .distantPast
+        nextCompatibleStatusExpiry = nil
+        compatibleResultRevision += 1
         lastSuccessfulStationFetchAt = nil
         catalogSyncedAt = nil
         catalogImportReport = nil
@@ -200,6 +219,7 @@ final class VoltWayStore {
             guard isCurrentAccount(accountRevision, userID: requestedSession?.userID),
                   stationRefreshRevision == refreshRevision else { return }
             stations = result.stations
+            rebuildCompatibleStations()
             sourceWarnings = result.warnings ?? []
             catalogSyncedAt = result.catalogSyncedAt
             catalogImportReport = result.catalogImportReport
@@ -297,6 +317,7 @@ final class VoltWayStore {
             let location = try await locationService.requestLocation()
             guard isCurrentAccount(accountRevision, userID: userID) else { return nil }
             currentLocation = location
+            rebuildCompatibleStations()
             return location
         } catch {
             if isCurrentAccount(accountRevision, userID: userID) { show(error) }
@@ -341,6 +362,7 @@ final class VoltWayStore {
             if createsNew || previous?.id == activeVehicleID || activeVehicleID == nil {
                 activeVehicleID = updated.id
                 profile = updated
+                rebuildCompatibleStations()
             }
             persistCarPlaySnapshot()
             errorMessage = nil
@@ -360,6 +382,7 @@ final class VoltWayStore {
             guard isCurrentAccount(accountRevision, userID: userID) else { return }
             activeVehicleID = vehicle.id
             profile = vehicle
+            rebuildCompatibleStations()
             persistCarPlaySnapshot()
         } catch {
             if isCurrentAccount(accountRevision, userID: userID) { show(error) }
@@ -379,6 +402,7 @@ final class VoltWayStore {
                 let next = vehicles.first
                 activeVehicleID = next?.id
                 profile = next ?? VehicleProfile(userID: session?.userID, connectors: [], minimumPowerKW: nil)
+                rebuildCompatibleStations()
             }
             persistCarPlaySnapshot()
             if deletedActiveVehicle, let session { try await backend.setActiveVehicle(activeVehicleID, session: session) }
@@ -436,8 +460,29 @@ final class VoltWayStore {
         let selected = profiles.first(where: { $0.id == selectedID }) ?? profiles.first
         activeVehicleID = selected?.id
         profile = selected ?? VehicleProfile(userID: session.userID, connectors: [], minimumPowerKW: nil)
+        rebuildCompatibleStations()
         favorites = loadedFavoritesResult
         await refreshStations()
+    }
+
+    func refreshAvailabilityOrderingIfNeeded(at date: Date) {
+        guard needsCompatibleRebuild(at: date) else { return }
+        rebuildCompatibleStations(at: date)
+    }
+
+    private func needsCompatibleRebuild(at date: Date) -> Bool {
+        date < compatibleSortDate || (nextCompatibleStatusExpiry.map { date > $0 } ?? false)
+    }
+
+    private func rebuildCompatibleStations(at date: Date = .now, notify: Bool = true) {
+        cachedCompatibleStations = StationDiscovery.compatibleStations(from: stations, profile: profile, near: currentLocation, now: date)
+        compatibleSortDate = date
+        nextCompatibleStatusExpiry = cachedCompatibleStations.compactMap { station -> Date? in
+            guard station.availability.state != .unknown, let updatedAt = station.availability.lastUpdated else { return nil }
+            let expiry = updatedAt.addingTimeInterval(300)
+            return expiry >= date ? expiry : nil
+        }.min()
+        if notify { compatibleResultRevision += 1 }
     }
 
     private func isCurrentAccount(_ revision: Int, userID: String?) -> Bool {
