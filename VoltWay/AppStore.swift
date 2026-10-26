@@ -21,6 +21,8 @@ final class VoltWayStore {
     private(set) var sourceWarnings: [String] = []
     private(set) var isBootstrapping = true
     private(set) var isLoadingStations = false
+    private(set) var isLoadingAccountData = false
+    private(set) var accountDataNeedsRetry = false
     private(set) var isAuthenticating = false
     private(set) var errorMessage: String?
     private(set) var noticeMessage: String?
@@ -34,13 +36,14 @@ final class VoltWayStore {
     @ObservationIgnored private var isSigningOut = false
     @ObservationIgnored private var cachedCompatibleStations: [ChargingStation] = []
     @ObservationIgnored private var compatibleSortDate = Date.distantPast
+    @ObservationIgnored private var nextCompatibleStatusActivation: Date?
     @ObservationIgnored private var nextCompatibleStatusExpiry: Date?
 
     init(configuration: AppConfiguration = .current, backend: BackendClient? = nil) {
         self.backend = backend ?? BackendClient(configuration: configuration)
         locationService = LocationService()
         isDemoMode = !configuration.isConfigured
-        profile = .demo
+        profile = isDemoMode ? .demo : VehicleProfile(connectors: [], minimumPowerKW: nil)
         vehicles = isDemoMode ? [.demo] : []
         activeVehicleID = isDemoMode ? VehicleProfile.demo.id : nil
         stations = isDemoMode ? DemoData.stations : []
@@ -97,7 +100,7 @@ final class VoltWayStore {
             guard accountRevision == revision else { return }
             session = restored
             if session != nil {
-                try await loadAccountData()
+                await retryAccountData()
             } else {
                 CarPlaySnapshotStore.clear()
             }
@@ -123,7 +126,7 @@ final class VoltWayStore {
             guard accountRevision == revision else { return }
             accountRevision += 1
             session = signedIn
-            try await loadAccountData()
+            await retryAccountData()
         } catch {
             if accountRevision == revision { show(error) }
         }
@@ -145,7 +148,7 @@ final class VoltWayStore {
             if let signedUp {
                 accountRevision += 1
                 session = signedUp
-                try await loadAccountData()
+                await retryAccountData()
             } else {
                 noticeMessage = "Check your email to confirm your VoltWay account, then sign in."
             }
@@ -182,10 +185,13 @@ final class VoltWayStore {
         vehicles = []
         activeVehicleID = nil
         profile = VehicleProfile(connectors: [], minimumPowerKW: nil)
+        isLoadingAccountData = false
+        accountDataNeedsRetry = false
         favorites = []
         currentLocation = nil
         cachedCompatibleStations = []
         compatibleSortDate = .distantPast
+        nextCompatibleStatusActivation = nil
         nextCompatibleStatusExpiry = nil
         compatibleResultRevision += 1
         lastSuccessfulStationFetchAt = nil
@@ -442,6 +448,25 @@ final class VoltWayStore {
         noticeMessage = nil
     }
 
+    func retryAccountData() async {
+        guard let session, !isLoadingAccountData, !isSigningOut else { return }
+        let revision = accountRevision
+        isLoadingAccountData = true
+        defer {
+            if isCurrentAccount(revision, userID: session.userID) { isLoadingAccountData = false }
+        }
+
+        do {
+            try await loadAccountData()
+            guard isCurrentAccount(revision, userID: session.userID) else { return }
+            accountDataNeedsRetry = false
+        } catch {
+            guard isCurrentAccount(revision, userID: session.userID) else { return }
+            accountDataNeedsRetry = true
+            show(error)
+        }
+    }
+
     func showValidationError(_ message: String) {
         errorMessage = message
     }
@@ -462,6 +487,10 @@ final class VoltWayStore {
         profile = selected ?? VehicleProfile(userID: session.userID, connectors: [], minimumPowerKW: nil)
         rebuildCompatibleStations()
         favorites = loadedFavoritesResult
+        // The account is usable before the independent charger catalog finishes loading.
+        accountDataNeedsRetry = false
+        isLoadingAccountData = false
+        isBootstrapping = false
         await refreshStations()
     }
 
@@ -471,12 +500,18 @@ final class VoltWayStore {
     }
 
     private func needsCompatibleRebuild(at date: Date) -> Bool {
-        date < compatibleSortDate || (nextCompatibleStatusExpiry.map { date > $0 } ?? false)
+        date < compatibleSortDate
+            || (nextCompatibleStatusActivation.map { date >= $0 } ?? false)
+            || (nextCompatibleStatusExpiry.map { date > $0 } ?? false)
     }
 
     private func rebuildCompatibleStations(at date: Date = .now, notify: Bool = true) {
         cachedCompatibleStations = StationDiscovery.compatibleStations(from: stations, profile: profile, near: currentLocation, now: date)
         compatibleSortDate = date
+        nextCompatibleStatusActivation = cachedCompatibleStations.compactMap { station -> Date? in
+            guard station.availability.state != .unknown, let updatedAt = station.availability.lastUpdated else { return nil }
+            return updatedAt > date ? updatedAt : nil
+        }.min()
         nextCompatibleStatusExpiry = cachedCompatibleStations.compactMap { station -> Date? in
             guard station.availability.state != .unknown, let updatedAt = station.availability.lastUpdated else { return nil }
             let expiry = updatedAt.addingTimeInterval(300)

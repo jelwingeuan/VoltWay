@@ -264,6 +264,19 @@ struct VoltWayTests {
         #expect(!current.isReportedAvailable(at: now.addingTimeInterval(1)))
     }
 
+    @Test("Future-dated status is unavailable and cannot pass Available now")
+    func futureAvailabilityIsUnavailable() {
+        let future = Availability(state: .available, availableConnectors: 2, totalConnectors: 2,
+                                  lastUpdated: now.addingTimeInterval(60))
+        let station = station(id: "future", connector: .ccs2, power: 180, state: .available,
+                              updatedAt: now.addingTimeInterval(60))
+
+        #expect(future.isStale(at: now))
+        #expect(future.isReportedAvailable(at: now) == false)
+        #expect(future.displayText(at: now) == "Status unavailable")
+        #expect(StationDiscovery.visibleStations(from: [station], query: "", availableNowOnly: true, now: now).isEmpty)
+    }
+
     @Test("Combined search and availability filters preserve the input sort order")
     func combinedDiscoveryFilters() {
         let first = station(id: "first", connector: .ccs2, power: 180, state: .available)
@@ -334,6 +347,15 @@ struct VoltWayTests {
         #expect(current.displayText(at: now).contains("1.50"))
     }
 
+    @Test("Future-dated price is unavailable and cannot produce an estimate")
+    func futurePriceIsUnavailable() {
+        let future = Price(amountMYR: 1.50, unit: .kWh, lastUpdated: now.addingTimeInterval(60))
+
+        #expect(future.isStale(at: now))
+        #expect(future.displayText(at: now) == "Price unavailable")
+        #expect(ChargingCostEstimate.amount(for: future, energyKWh: 20, at: now) == nil)
+    }
+
     @Test("Energy estimates use only fresh per-kWh MYR prices and round to cents")
     func chargingCostEstimates() {
         let price = Price(amountMYR: Decimal(string: "1.237")!, unit: .kWh, lastUpdated: now)
@@ -402,6 +424,15 @@ struct VoltWayTests {
         let defaults = try #require(UserDefaults(suiteName: "VoltWayTests.\(UUID().uuidString)"))
         CarPlaySnapshotStore.save(stations: DemoData.stations, favoriteStationIDs: [], isDemo: true, defaults: defaults)
         #expect(CarPlaySnapshotStore.load(defaults: defaults).isDemo)
+    }
+
+    @Test("Apple Maps handoff keeps the selected directory site's coordinate")
+    @MainActor func mapsHandoffCoordinate() throws {
+        let station = try #require(DemoData.stations.first { $0.id == "ocm:505443" })
+        let item = MapsHandoff.mapItem(for: station)
+        #expect(item.name == station.name)
+        #expect(item.location.coordinate.latitude == station.coordinate.latitude)
+        #expect(item.location.coordinate.longitude == station.coordinate.longitude)
     }
 
     @Test("Private charger coordinates are excluded from CarPlay snapshots")
@@ -505,9 +536,214 @@ struct VoltWayTests {
     }
 }
 
+struct CarPlayPresentationTests {
+    private let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+    @Test("CarPlay fact refresh follows status and price expiry")
+    func freshnessTransitions() throws {
+        let station = ChargingStation(
+            id: "live", name: "Live charger", address: "Malaysia",
+            coordinate: Coordinate(latitude: 3.14, longitude: 101.68), operatorName: "Gentari",
+            connectors: [Connector(kind: .ccs2, powerKW: 150, count: 2)],
+            availability: Availability(state: .available, availableConnectors: 1, totalConnectors: 2,
+                                       lastUpdated: now.addingTimeInterval(-300)),
+            price: Price(amountMYR: 1.50, unit: .kWh, lastUpdated: now.addingTimeInterval(-86_300))
+        )
+
+        let statusChange = try #require(CarPlayPresentation.nextFreshnessUpdate(in: [station], after: now))
+        #expect(statusChange > now)
+        #expect(statusChange < now.addingTimeInterval(1))
+        #expect(station.availability.displayText(at: statusChange) == "Status unavailable")
+
+        let priceChange = try #require(CarPlayPresentation.nextFreshnessUpdate(in: [station], after: statusChange))
+        #expect(priceChange > now.addingTimeInterval(100))
+        #expect(priceChange < now.addingTimeInterval(101))
+        #expect(station.price?.displayText(at: priceChange) == "Price unavailable")
+        #expect(CarPlayPresentation.nextFreshnessUpdate(in: [station], after: priceChange) == nil)
+        #expect(CarPlayPresentation.nextFreshnessUpdate(in: DemoData.stations, after: now) == nil)
+    }
+
+    @Test("CarPlay tracks a future timestamp becoming current")
+    func futureTimestampTransition() throws {
+        let station = ChargingStation(
+            id: "future", name: "Future report", address: "Malaysia",
+            coordinate: Coordinate(latitude: 3.14, longitude: 101.68), operatorName: "Gentari",
+            connectors: [Connector(kind: .ccs2, powerKW: 150, count: 2)],
+            availability: Availability(state: .available, availableConnectors: 1, totalConnectors: 2,
+                                       lastUpdated: now.addingTimeInterval(60)), price: nil
+        )
+
+        #expect(station.availability.displayText(at: now) == "Status unavailable")
+        let transition = try #require(CarPlayPresentation.nextFreshnessUpdate(in: [station], after: now))
+        #expect(transition > now.addingTimeInterval(60))
+        #expect(transition < now.addingTimeInterval(61))
+        let expiry = try #require(CarPlayPresentation.nextFreshnessUpdate(in: [station], after: transition))
+        #expect(expiry > now.addingTimeInterval(360))
+        #expect(expiry < now.addingTimeInterval(361))
+    }
+
+    @Test("CarPlay pages every saved charger within the template item limit")
+    func savedPagesAreReachable() {
+        let first = CarPlayPresentation.page(totalCount: 27, startingAt: 0, maximumItemCount: 12)
+        let second = CarPlayPresentation.page(totalCount: 27, startingAt: 11, maximumItemCount: 12)
+        let third = CarPlayPresentation.page(totalCount: 27, startingAt: 22, maximumItemCount: 12)
+
+        #expect(Array(first.range) + Array(second.range) + Array(third.range) == Array(0..<27))
+        #expect(first.nextStart == 11)
+        #expect(second.nextStart == 22)
+        #expect(third.nextStart == 0)
+        #expect(first.range.count + 1 <= 12)
+        #expect(second.range.count + 1 <= 12)
+        #expect(third.range.count + 1 <= 12)
+
+        let small = CarPlayPresentation.page(totalCount: 5, startingAt: 0, maximumItemCount: 3)
+        #expect(small.range == 0..<2)
+        #expect(small.nextStart == 2)
+        let constrained = CarPlayPresentation.page(totalCount: 5, startingAt: 0, maximumItemCount: 1)
+        #expect(constrained.hasUnreachableItems)
+        let exact = CarPlayPresentation.page(totalCount: 12, startingAt: 0, maximumItemCount: 12)
+        #expect(exact.range == 0..<12)
+        #expect(exact.nextStart == nil)
+    }
+}
+
 @Suite(.serialized)
 struct BackendClientTests {
     private let configuration = AppConfiguration(supabaseURL: URL(string: "https://voltway.test"), supabaseAnonKey: "public-anon-key")
+
+    @Test("A successful login can retry an account-data load failure", arguments: ["/auth/v1/token", "/auth/v1/signup"])
+    @MainActor func accountLoadFailureCanRetry(authPath: String) async throws {
+        let profileRequests = LockedCounter()
+        let profile = VehicleProfile(userID: "user-1", name: "Daily EV", connectors: [.ccs2], minimumPowerKW: nil)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let profiles = try encoder.encode([profile])
+        MockURLProtocol.handler = { request in
+            switch request.url?.path {
+            case authPath:
+                return (200, Data(#"{"access_token":"fresh","refresh_token":"refresh-1","user":{"id":"user-1","email":"driver@example.com"}}"#.utf8))
+            case "/rest/v1/vehicle_profiles":
+                profileRequests.increment()
+                return profileRequests.value == 1
+                    ? (503, Data(#"{"message":"Profiles unavailable"}"#.utf8))
+                    : (200, profiles)
+            case "/rest/v1/user_preferences", "/rest/v1/favorite_stations":
+                return (200, Data("[]".utf8))
+            case "/functions/v1/stations":
+                return (200, Data(#"{"stations":[]}"#.utf8))
+            default:
+                return (404, Data(#"{"message":"Unexpected request"}"#.utf8))
+            }
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let store = VoltWayStore(configuration: configuration, backend: makeClient(account: "test-\(UUID().uuidString)"))
+        if authPath == "/auth/v1/signup" {
+            await store.signUp(email: "driver@example.com", password: "password-123")
+        } else {
+            await store.signIn(email: "driver@example.com", password: "password-123")
+        }
+
+        #expect(store.session?.userID == "user-1")
+        #expect(store.accountDataNeedsRetry)
+        #expect(store.isLoadingAccountData == false)
+        #expect(store.errorMessage == "Profiles unavailable")
+        #expect(store.vehicles.isEmpty)
+        #expect(store.stations.isEmpty)
+
+        await store.retryAccountData()
+        #expect(store.accountDataNeedsRetry == false)
+        #expect(store.isLoadingAccountData == false)
+        #expect(store.errorMessage == nil)
+        #expect(store.profile.name == "Daily EV")
+        #expect(store.vehicles.map(\.id) == [profile.id])
+        #expect(profileRequests.value == 2)
+        await store.signOut()
+    }
+
+    @Test("A slow charger refresh does not keep account loading on screen")
+    @MainActor func accountReadyBeforeStationRefresh() async throws {
+        let stationRequests = LockedCounter()
+        let releaseStations = DispatchSemaphore(value: 0)
+        let profile = VehicleProfile(userID: "user-1", name: "Daily EV", connectors: [.ccs2], minimumPowerKW: nil)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let profiles = try encoder.encode([profile])
+        MockURLProtocol.handler = { request in
+            switch request.url?.path {
+            case "/auth/v1/token":
+                return (200, Data(#"{"access_token":"fresh","refresh_token":"refresh-1","user":{"id":"user-1","email":"driver@example.com"}}"#.utf8))
+            case "/rest/v1/vehicle_profiles":
+                return (200, profiles)
+            case "/rest/v1/user_preferences", "/rest/v1/favorite_stations":
+                return (200, Data("[]".utf8))
+            case "/functions/v1/stations":
+                stationRequests.increment()
+                releaseStations.wait()
+                return (200, Data(#"{"stations":[]}"#.utf8))
+            default:
+                return (404, Data(#"{"message":"Unexpected request"}"#.utf8))
+            }
+        }
+        defer {
+            releaseStations.signal()
+            MockURLProtocol.handler = nil
+        }
+
+        let store = VoltWayStore(configuration: configuration, backend: makeClient(account: "test-\(UUID().uuidString)"))
+        let signIn = Task { await store.signIn(email: "driver@example.com", password: "password-123") }
+        for _ in 0..<100 where stationRequests.value == 0 {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(stationRequests.value == 1)
+        #expect(store.isBootstrapping == false)
+        #expect(store.isLoadingAccountData == false)
+        #expect(store.accountDataNeedsRetry == false)
+        #expect(store.vehicles.map(\.id) == [profile.id])
+        #expect(store.isLoadingStations)
+
+        releaseStations.signal()
+        await signIn.value
+        await store.signOut()
+    }
+
+    @Test("A restored session can retry account data without signing in again")
+    @MainActor func restoredAccountCanRetry() async throws {
+        let profileRequests = LockedCounter()
+        MockURLProtocol.handler = { request in
+            switch request.url?.path {
+            case "/auth/v1/token":
+                return (200, Data(#"{"access_token":"fresh","refresh_token":"refresh-1","user":{"id":"user-1","email":"driver@example.com"}}"#.utf8))
+            case "/rest/v1/vehicle_profiles":
+                profileRequests.increment()
+                return profileRequests.value == 1
+                    ? (503, Data(#"{"message":"Profiles unavailable"}"#.utf8))
+                    : (200, Data("[]".utf8))
+            case "/rest/v1/user_preferences", "/rest/v1/favorite_stations":
+                return (200, Data("[]".utf8))
+            case "/functions/v1/stations":
+                return (200, Data(#"{"stations":[]}"#.utf8))
+            default:
+                return (404, Data(#"{"message":"Unexpected request"}"#.utf8))
+            }
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let client = makeClient(account: "test-\(UUID().uuidString)")
+        _ = try await client.signIn(email: "driver@example.com", password: "password-123")
+        let store = VoltWayStore(configuration: configuration, backend: client)
+        await store.bootstrap()
+        #expect(store.isBootstrapping == false)
+        #expect(store.session?.userID == "user-1")
+        #expect(store.accountDataNeedsRetry)
+        #expect(store.errorMessage == "Profiles unavailable")
+
+        await store.retryAccountData()
+        #expect(store.accountDataNeedsRetry == false)
+        #expect(store.errorMessage == nil)
+        #expect(profileRequests.value == 2)
+        await store.signOut()
+    }
 
     @Test("Station responses preserve partial-source warnings and fractional sync timestamps")
     @MainActor func partialCoverageMetadata() async throws {
@@ -738,6 +974,53 @@ struct BackendClientTests {
         #expect(store.compatibleStations(at: now.addingTimeInterval(30)).map(\.id) == ["fresh", "unknown"])
         #expect(store.compatibleStations(at: now.addingTimeInterval(90)).map(\.id) == ["unknown", "fresh"])
         #expect(store.compatibleStations(at: now.addingTimeInterval(90)).map(\.id) == ["unknown", "fresh"])
+        #expect(stationRequests.value == 1)
+        await store.signOut()
+    }
+
+    @Test("Compatible order updates when a future partner timestamp becomes current")
+    @MainActor func futureCompatibilityFreshnessBoundary() async throws {
+        let now = Date.now
+        let activation = now.addingTimeInterval(600)
+        let profile = VehicleProfile(userID: "user-1", connectors: [.ccs2], minimumPowerKW: nil)
+        let futureAvailable = ChargingStation(
+            id: "future", name: "Zeta Charger", address: "Malaysia",
+            coordinate: Coordinate(latitude: 3.14, longitude: 101.68), operatorName: "Gentari",
+            connectors: [Connector(kind: .ccs2, powerKW: 150, count: 2)],
+            availability: Availability(state: .available, availableConnectors: 1, totalConnectors: 2,
+                                       lastUpdated: activation), price: nil
+        )
+        let unknown = ChargingStation(
+            id: "unknown", name: "Alpha Charger", address: "Malaysia",
+            coordinate: Coordinate(latitude: 3.15, longitude: 101.69), operatorName: "Gentari",
+            connectors: [Connector(kind: .ccs2, powerKW: 150, count: 2)],
+            availability: Availability(state: .unknown, availableConnectors: nil, totalConnectors: nil,
+                                       lastUpdated: nil), price: nil
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let profiles = try encoder.encode([profile])
+        let stations = Data(#"{"stations": "#.utf8) + (try encoder.encode([futureAvailable, unknown])) + Data("}".utf8)
+        let stationRequests = LockedCounter()
+        MockURLProtocol.handler = { request in
+            switch request.url?.path {
+            case "/auth/v1/token":
+                return (200, Data(#"{"access_token":"fresh","refresh_token":"refresh-1","user":{"id":"user-1","email":"driver@example.com"}}"#.utf8))
+            case "/rest/v1/vehicle_profiles":
+                return (200, profiles)
+            case "/functions/v1/stations":
+                stationRequests.increment()
+                return (200, stations)
+            default:
+                return (200, Data("[]".utf8))
+            }
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let store = VoltWayStore(configuration: configuration, backend: makeClient(account: "test-\(UUID().uuidString)"))
+        await store.signIn(email: "driver@example.com", password: "password-123")
+        #expect(store.compatibleStations(at: now.addingTimeInterval(30)).map(\.id) == ["unknown", "future"])
+        #expect(store.compatibleStations(at: activation.addingTimeInterval(1)).map(\.id) == ["future", "unknown"])
         #expect(stationRequests.value == 1)
         await store.signOut()
     }

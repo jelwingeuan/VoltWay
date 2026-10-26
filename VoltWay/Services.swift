@@ -581,11 +581,14 @@ enum LocationError: LocalizedError {
 
 @MainActor
 enum MapsHandoff {
-    static func open(_ station: ChargingStation) {
-        let coordinate = CLLocationCoordinate2D(latitude: station.coordinate.latitude, longitude: station.coordinate.longitude)
-        let item = MKMapItem(placemark: MKPlacemark(coordinate: coordinate))
+    static func mapItem(for station: ChargingStation) -> MKMapItem {
+        let item = MKMapItem(location: station.coordinate.coreLocation, address: nil)
         item.name = station.name
-        item.openInMaps(launchOptions: [MKLaunchOptionsDirectionsModeKey: MKLaunchOptionsDirectionsModeDriving])
+        return item
+    }
+
+    static func open(_ station: ChargingStation) {
+        mapItem(for: station).openInMaps(launchOptions: [MKLaunchOptionsDirectionsModeKey: MKLaunchOptionsDirectionsModeDriving])
     }
 }
 

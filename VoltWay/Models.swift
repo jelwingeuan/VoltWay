@@ -205,7 +205,8 @@ struct Availability: Codable, Equatable, Hashable, Sendable {
 
     func isStale(at date: Date = .now, after interval: TimeInterval = 300) -> Bool {
         guard let lastUpdated else { return true }
-        return date.timeIntervalSince(lastUpdated) > interval
+        let age = date.timeIntervalSince(lastUpdated)
+        return age < 0 || age > interval
     }
 
     func isReportedAvailable(at date: Date = .now) -> Bool {
@@ -242,7 +243,8 @@ struct Price: Codable, Equatable, Hashable, Sendable {
 
     func isStale(at date: Date = .now, after interval: TimeInterval = 86_400) -> Bool {
         guard let lastUpdated else { return true }
-        return date.timeIntervalSince(lastUpdated) > interval
+        let age = date.timeIntervalSince(lastUpdated)
+        return age < 0 || age > interval
     }
 
     func displayText(at date: Date = .now) -> String {
@@ -578,6 +580,56 @@ struct UserSession: Codable, Equatable, Sendable {
     let email: String
     let accessToken: String
     let refreshToken: String
+}
+
+enum CarPlayPresentation {
+    struct Page: Equatable {
+        let range: Range<Int>
+        let nextStart: Int?
+        let hasUnreachableItems: Bool
+    }
+
+    static func page(totalCount: Int, startingAt start: Int, maximumItemCount: Int) -> Page {
+        guard totalCount > 0 else { return Page(range: 0..<0, nextStart: nil, hasUnreachableItems: false) }
+        guard maximumItemCount >= 2 else {
+            return Page(range: totalCount > 1 ? 0..<0 : 0..<1,
+                        nextStart: nil, hasUnreachableItems: totalCount > 1)
+        }
+        if totalCount <= maximumItemCount {
+            return Page(range: 0..<totalCount, nextStart: nil, hasUnreachableItems: false)
+        }
+        let pageSize = maximumItemCount - 1
+        let safeStart = (0..<totalCount).contains(start) ? start : 0
+        let end = min(totalCount, safeStart + pageSize)
+        return Page(range: safeStart..<end, nextStart: end == totalCount ? 0 : end,
+                    hasUnreachableItems: false)
+    }
+
+    static func nextFreshnessUpdate(in stations: [ChargingStation], after date: Date) -> Date? {
+        var next: Date?
+        for station in stations {
+            if station.availability.state != .unknown,
+               let updated = station.availability.lastUpdated {
+                next = earlier(next, transition(for: updated, window: 300, after: date))
+            }
+            if let updated = station.price?.lastUpdated {
+                next = earlier(next, transition(for: updated, window: 86_400, after: date))
+            }
+        }
+        return next
+    }
+
+    private static func transition(for updated: Date, window: TimeInterval, after date: Date) -> Date? {
+        if updated > date { return updated.addingTimeInterval(0.01) }
+        let expiry = updated.addingTimeInterval(window)
+        return expiry >= date ? expiry.addingTimeInterval(0.01) : nil
+    }
+
+    private static func earlier(_ first: Date?, _ second: Date?) -> Date? {
+        guard let first else { return second }
+        guard let second else { return first }
+        return min(first, second)
+    }
 }
 
 struct CarPlaySnapshot: Codable, Equatable, Sendable {

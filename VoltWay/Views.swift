@@ -7,10 +7,10 @@ struct RootView: View {
 
     var body: some View {
         Group {
-            if store.isBootstrapping {
+            if store.isBootstrapping || (store.session != nil && store.isLoadingAccountData) {
                 ZStack {
                     Color.voltBackground.ignoresSafeArea()
-                    ProgressView("Preparing VoltWay…")
+                    ProgressView(store.isBootstrapping ? "Preparing VoltWay…" : "Syncing your account…")
                 }
             } else if store.isDemoMode || store.session != nil {
                 MainTabView(store: store)
@@ -1571,11 +1571,12 @@ struct TripPlannerView: View {
             let response = try await MKLocalSearch(request: request).start()
             destinations = response.mapItems.compactMap { item in
                 guard let name = item.name else { return nil }
-                let coordinate = item.placemark.coordinate
+                let coordinate = item.location.coordinate
                 guard (0.8...7.5).contains(coordinate.latitude), (99.5...119.8).contains(coordinate.longitude) else { return nil }
                 return TripDestination(
                     name: name,
-                    address: item.placemark.title ?? "Malaysia",
+                    address: item.addressRepresentations?.fullAddress(includingRegion: false, singleLine: true)
+                        ?? item.address?.fullAddress ?? "Malaysia",
                     coordinate: Coordinate(latitude: coordinate.latitude, longitude: coordinate.longitude)
                 )
             }
@@ -1600,8 +1601,8 @@ struct TripPlannerView: View {
         }
 
         let request = MKDirections.Request()
-        request.source = MKMapItem(placemark: MKPlacemark(coordinate: CLLocationCoordinate2D(latitude: origin.latitude, longitude: origin.longitude)))
-        request.destination = MKMapItem(placemark: MKPlacemark(coordinate: CLLocationCoordinate2D(latitude: destination.coordinate.latitude, longitude: destination.coordinate.longitude)))
+        request.source = MKMapItem(location: origin.coreLocation, address: nil)
+        request.destination = MKMapItem(location: destination.coordinate.coreLocation, address: nil)
         request.transportType = .automobile
         do {
             let response = try await MKDirections(request: request).calculate()
@@ -1718,6 +1719,16 @@ struct ProfileView: View {
         List {
             if let error = store.errorMessage {
                 Section { MessageBanner(message: error, isError: true, dismiss: store.clearMessages) }
+            }
+            if store.accountDataNeedsRetry {
+                Section {
+                    Button("Retry account sync", systemImage: "arrow.clockwise") {
+                        Task { await store.retryAccountData() }
+                    }
+                    .disabled(store.isLoadingAccountData)
+                } footer: {
+                    Text("Your sign-in succeeded, but vehicles and saved chargers could not be loaded.")
+                }
             }
             if let notice = store.noticeMessage {
                 Section { MessageBanner(message: notice, isError: false, dismiss: store.clearMessages) }
