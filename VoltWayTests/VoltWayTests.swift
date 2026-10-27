@@ -407,6 +407,23 @@ struct VoltWayTests {
         #expect(try #require(stops.first).routeProgressMeters < stops[1].routeProgressMeters)
     }
 
+    @Test("Off-main route matching preserves ordered corridor results")
+    @MainActor func offMainRouteStops() async {
+        let route = [Coordinate(latitude: 3, longitude: 101), Coordinate(latitude: 3, longitude: 102)]
+        let nearEnd = station(id: "end", connector: .ccs2, power: 100, state: .unknown,
+                              coordinate: Coordinate(latitude: 3.01, longitude: 101.8))
+        let nearStart = station(id: "start", connector: .ccs2, power: 100, state: .unknown,
+                                coordinate: Coordinate(latitude: 3.01, longitude: 101.2))
+        let farAway = station(id: "far", connector: .ccs2, power: 100, state: .unknown,
+                              coordinate: Coordinate(latitude: 4, longitude: 101.5))
+        let stations = [nearEnd, farAway, nearStart]
+
+        let offMain = await RouteStopMatcher.stopsOffMain(along: route, compatibleStations: stations)
+        let synchronous = RouteStopMatcher.stops(along: route, compatibleStations: stations)
+        #expect(offMain == synchronous)
+        #expect(offMain.map { $0.station.id } == ["start", "end"])
+    }
+
     @Test("CarPlay does not fabricate stations after its snapshot is cleared")
     @MainActor func clearedCarPlaySnapshot() throws {
         let defaults = try #require(UserDefaults(suiteName: "VoltWayTests.\(UUID().uuidString)"))
@@ -1048,6 +1065,71 @@ struct BackendClientTests {
         await store.signIn(email: "driver@example.com", password: "password-123")
         #expect(store.favorites.count == 1)
         #expect(store.favoriteStations.isEmpty)
+        await store.signOut()
+    }
+
+    @Test("Saved aliases use current catalog facts and remove their original favorite IDs")
+    @MainActor func mergedFavoriteAliases() async throws {
+        func station(_ id: String, name: String, source: StationSource) -> ChargingStation {
+            ChargingStation(
+                id: id, name: name, address: "Kuala Lumpur",
+                coordinate: Coordinate(latitude: 3.14, longitude: 101.68), operatorName: "Gentari",
+                connectors: [Connector(kind: .ccs2, powerKW: 120, count: 2)],
+                availability: Availability(state: .unknown, availableConnectors: nil, totalConnectors: nil, lastUpdated: nil),
+                price: nil, source: source
+            )
+        }
+
+        var current = station("gentari-site", name: "Current catalog", source: .gentari)
+        current.sourceIDs = ["gentari": "gentari-site", "openChargeMap": "ocm:42", "mevnet": "7"]
+        let oldOCM = station("ocm:42", name: "Old directory", source: .openChargeMap)
+        let oldMEVnet = station("mevnet:7", name: "Old planning site", source: .mevnet)
+        let legacy = station("legacy-site", name: "Saved partner snapshot", source: .gentari)
+        let missingPrivate = station("private:gone", name: "Private snapshot", source: .ownerProvided)
+        let favorites = [oldOCM, legacy, oldMEVnet, missingPrivate].map {
+            FavoriteStation(userID: "user-1", stationID: $0.id, stationSnapshot: $0, createdAt: nil)
+        }
+        let encoder = JSONEncoder()
+        let favoriteResponse = try encoder.encode(favorites)
+        let catalog = try encoder.encode([current, station("gentari-site", name: "Later duplicate", source: .gentari)])
+        let stationResponse = Data(#"{"stations":"#.utf8) + catalog + Data("}".utf8)
+        let deletedOCM = LockedCounter()
+        let deletedMEVnet = LockedCounter()
+        MockURLProtocol.handler = { request in
+            switch (request.url?.path, request.httpMethod) {
+            case ("/auth/v1/token", _):
+                return (200, Data(#"{"access_token":"fresh","refresh_token":"refresh-1","user":{"id":"user-1","email":"driver@example.com"}}"#.utf8))
+            case ("/rest/v1/favorite_stations", "GET"):
+                return (200, favoriteResponse)
+            case ("/functions/v1/stations", _):
+                return (200, stationResponse)
+            case ("/rest/v1/favorite_stations", "DELETE"):
+                let stationID = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "station_id" }?.value
+                switch stationID {
+                case "eq.ocm:42": deletedOCM.increment()
+                case "eq.mevnet:7": deletedMEVnet.increment()
+                default: return (400, Data(#"{"message":"Unexpected favorite ID"}"#.utf8))
+                }
+                return (204, Data())
+            default:
+                return (200, Data("[]".utf8))
+            }
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let store = VoltWayStore(configuration: configuration, backend: makeClient(account: "test-\(UUID().uuidString)"))
+        await store.signIn(email: "driver@example.com", password: "password-123")
+        #expect(store.favoriteStations == [current, legacy])
+        #expect(store.favoriteStationIDs.contains("gentari-site"))
+        #expect(store.favoriteStationIDs.contains("ocm:42"))
+        #expect(store.favoriteStationIDs.contains("mevnet:7"))
+
+        await store.toggleFavorite(current)
+        #expect(store.favorites.map(\.stationID) == ["legacy-site", "private:gone"])
+        #expect(store.favoriteStations == [legacy])
+        #expect(store.favoriteStationIDs.contains("gentari-site") == false)
+        #expect(deletedOCM.value == 1)
+        #expect(deletedMEVnet.value == 1)
         await store.signOut()
     }
 

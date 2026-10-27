@@ -1324,6 +1324,9 @@ struct TripPlannerView: View {
     @State private var selectedDestination: TripDestination?
     @State private var isSearching = false
     @State private var isPlanning = false
+    @State private var isMatchingRouteStops = false
+    @State private var routeRequestID = UUID()
+    @State private var routeMatchID = UUID()
     @State private var routeCoordinates: [Coordinate] = []
     @State private var routeStops: [RouteStopCandidate] = []
     @State private var routeDistanceMeters: Double?
@@ -1379,11 +1382,18 @@ struct TripPlannerView: View {
                     }
             }
         }
-        .onChange(of: store.activeVehicleID) { _, _ in
-            if !routeCoordinates.isEmpty {
-                routeStops = RouteStopMatcher.stops(along: routeCoordinates, compatibleStations: store.compatibleStations)
-                selectedStationID = nil
-            }
+        .onChange(of: store.profile) { _, _ in refreshRouteStops() }
+        .onChange(of: store.lastSuccessfulStationFetchAt) { _, _ in refreshRouteStops() }
+        .task(id: routeMatchID) {
+            guard !routeCoordinates.isEmpty else { return }
+            let matchID = routeMatchID
+            let stops = await RouteStopMatcher.stopsOffMain(
+                along: routeCoordinates,
+                compatibleStations: store.compatibleStations
+            )
+            guard !Task.isCancelled, routeMatchID == matchID else { return }
+            routeStops = stops
+            isMatchingRouteStops = false
         }
     }
 
@@ -1433,8 +1443,13 @@ struct TripPlannerView: View {
             ForEach(destinations) { destination in
                 Button {
                     selectedDestination = destination
+                    routeRequestID = UUID()
+                    routeMatchID = UUID()
+                    isPlanning = false
+                    isMatchingRouteStops = false
                     routeCoordinates = []
                     routeStops = []
+                    selectedStationID = nil
                     routeMessage = nil
                 } label: {
                     VStack(alignment: .leading, spacing: 4) {
@@ -1467,7 +1482,7 @@ struct TripPlannerView: View {
                         }
                         .buttonStyle(.glassProminent)
                         .tint(.voltBlue)
-                        .disabled(isPlanning || store.isLoadingStations || store.profile.connectors.isEmpty)
+                        .disabled(isPlanning || store.isLoadingStations || store.profile.connectors.isEmpty || store.stations.isEmpty)
                         if store.profile.connectors.isEmpty {
                             Button("Set up vehicle connectors") { showingVehicleProfile = true }
                                 .font(.subheadline.weight(.semibold))
@@ -1477,6 +1492,14 @@ struct TripPlannerView: View {
                 }
                 if store.isLoadingStations {
                     Text("Loading compatible chargers…").font(.caption).foregroundStyle(.secondary)
+                } else if store.stations.isEmpty {
+                    Text("No charger catalog is loaded, so route stops cannot be checked yet.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button("Refresh chargers", systemImage: "arrow.clockwise") {
+                        Task { await store.refreshStations() }
+                    }
+                    .buttonStyle(.glass)
                 }
             }
         }
@@ -1495,7 +1518,26 @@ struct TripPlannerView: View {
                     .clipShape(.rect(cornerRadius: 18))
                 Text("Compatible chargers within 5 km of route")
                     .font(.title3.weight(.bold))
-                if routeStops.isEmpty {
+                if isMatchingRouteStops {
+                    ProgressView("Checking chargers along the route…")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } else if store.profile.connectors.isEmpty {
+                    EmptyState(
+                        icon: "car.side.lock",
+                        title: "Set up your vehicle",
+                        detail: "Choose its connectors before checking compatible route stops.",
+                        actionTitle: "Set up vehicle",
+                        action: { showingVehicleProfile = true }
+                    )
+                } else if store.stations.isEmpty {
+                    EmptyState(
+                        icon: "wifi.exclamationmark",
+                        title: "Charger catalog unavailable",
+                        detail: "Refresh chargers before relying on route-stop results.",
+                        actionTitle: "Refresh chargers",
+                        action: { Task { await store.refreshStations() } }
+                    )
+                } else if routeStops.isEmpty {
                     EmptyState(
                         icon: "bolt.slash",
                         title: "No chargers along this route",
@@ -1587,18 +1629,27 @@ struct TripPlannerView: View {
     }
 
     private func planRoute(to destination: TripDestination) async {
+        routeRequestID = UUID()
+        let requestID = routeRequestID
+        routeMatchID = UUID()
         isPlanning = true
+        isMatchingRouteStops = false
         routeMessage = nil
         routeCoordinates = []
         routeStops = []
         routeDistanceMeters = nil
         routeTravelTime = nil
-        defer { isPlanning = false }
+        defer {
+            if routeRequestID == requestID { isPlanning = false }
+        }
 
         guard let origin = await store.useCurrentLocation() else {
-            routeMessage = "Location is unavailable or denied. Allow location access in Settings to plan this trip."
+            if routeRequestID == requestID {
+                routeMessage = "Location is unavailable or denied. Allow location access in Settings to plan this trip."
+            }
             return
         }
+        guard routeRequestID == requestID, selectedDestination?.id == destination.id else { return }
 
         let request = MKDirections.Request()
         request.source = MKMapItem(location: origin.coreLocation, address: nil)
@@ -1606,19 +1657,34 @@ struct TripPlannerView: View {
         request.transportType = .automobile
         do {
             let response = try await MKDirections(request: request).calculate()
+            guard routeRequestID == requestID, selectedDestination?.id == destination.id else { return }
             guard let route = response.routes.first else {
                 routeMessage = "No driving route was found between your location and the selected destination."
+                return
+            }
+            guard route.polyline.pointCount > 0 else {
+                routeMessage = "The driving route has no usable map geometry. Try another destination."
                 return
             }
             var coordinates = Array(repeating: CLLocationCoordinate2D(), count: route.polyline.pointCount)
             route.polyline.getCoordinates(&coordinates, range: NSRange(location: 0, length: route.polyline.pointCount))
             routeCoordinates = coordinates.map { Coordinate(latitude: $0.latitude, longitude: $0.longitude) }
-            routeStops = RouteStopMatcher.stops(along: routeCoordinates, compatibleStations: store.compatibleStations)
             routeDistanceMeters = route.distance
             routeTravelTime = route.expectedTravelTime
+            refreshRouteStops()
         } catch {
-            routeMessage = "No route could be calculated. Check your connection or choose another destination."
+            if routeRequestID == requestID, selectedDestination?.id == destination.id {
+                routeMessage = "No route could be calculated. Check your connection or choose another destination."
+            }
         }
+    }
+
+    private func refreshRouteStops() {
+        guard !routeCoordinates.isEmpty else { return }
+        routeStops = []
+        selectedStationID = nil
+        isMatchingRouteStops = true
+        routeMatchID = UUID()
     }
 
     private func routeRegion(for coordinates: [Coordinate]) -> MKCoordinateRegion {
@@ -1642,6 +1708,7 @@ struct FavoritesView: View {
     @Namespace private var stationTransition
 
     var body: some View {
+        let savedStations = store.favoriteStations
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
                 VoltGlassPanel(cornerRadius: 28) {
@@ -1661,7 +1728,9 @@ struct FavoritesView: View {
                                 .symbolRenderingMode(.hierarchical)
                                 .accessibilityHidden(true)
                         }
-                        Text("\(store.favoriteStations.count) available")
+                        Text(store.favorites.count > savedStations.count
+                             ? "\(savedStations.count) of \(store.favorites.count) saved sites shown"
+                             : "\(savedStations.count) saved sites")
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.secondary)
                     }
@@ -1671,7 +1740,18 @@ struct FavoritesView: View {
                     DemoNotice()
                         .padding(.bottom, 18)
                 }
-                if store.favoriteStations.isEmpty {
+                if savedStations.isEmpty && !store.favorites.isEmpty && store.stations.isEmpty && store.isLoadingStations {
+                    ProgressView("Loading saved chargers…")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } else if savedStations.isEmpty && !store.favorites.isEmpty && store.stations.isEmpty && store.errorMessage != nil {
+                    EmptyState(
+                        icon: "wifi.exclamationmark",
+                        title: "Saved chargers could not load",
+                        detail: "The charger catalog is unavailable. Your saved sites are still on your account.",
+                        actionTitle: "Retry",
+                        action: { Task { await store.refreshStations() } }
+                    )
+                } else if savedStations.isEmpty {
                     EmptyState(
                         icon: "heart",
                         title: store.favorites.isEmpty ? "No saved chargers" : "Saved sites unavailable",
@@ -1681,7 +1761,7 @@ struct FavoritesView: View {
                         action: nil
                     )
                 } else {
-                    ForEach(store.favoriteStations) { station in
+                    ForEach(savedStations) { station in
                         NavigationLink {
                             StationDetailView(station: station, store: store)
                                 .navigationTransition(.zoom(sourceID: station.id, in: stationTransition))

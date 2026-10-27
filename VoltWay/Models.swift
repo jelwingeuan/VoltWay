@@ -283,18 +283,52 @@ enum RouteStopMatcher {
         compatibleStations: [ChargingStation],
         corridorMeters: Double = 5_000
     ) -> [RouteStopCandidate] {
+        collectStops(along: route, compatibleStations: compatibleStations, corridorMeters: corridorMeters) { false }
+    }
+
+    @concurrent static func stopsOffMain(
+        along route: [Coordinate],
+        compatibleStations: [ChargingStation],
+        corridorMeters: Double = 5_000
+    ) async -> [RouteStopCandidate] {
+        collectStops(along: route, compatibleStations: compatibleStations, corridorMeters: corridorMeters) { Task.isCancelled }
+    }
+
+    private static func collectStops(
+        along route: [Coordinate],
+        compatibleStations: [ChargingStation],
+        corridorMeters: Double,
+        isCancelled: () -> Bool
+    ) -> [RouteStopCandidate] {
         guard !route.isEmpty, corridorMeters >= 0 else { return [] }
-        return compatibleStations.compactMap { station in
-            guard let match = nearestPoint(to: station.coordinate, on: route), match.distance <= corridorMeters else { return nil }
-            return RouteStopCandidate(station: station, offRouteMeters: match.distance, routeProgressMeters: match.progress)
+        // A generous geographic box skips distant nationwide sites before segment matching.
+        let latitudes = route.map(\.latitude)
+        let longitudes = route.map(\.longitude)
+        guard let minLatitude = latitudes.min(), let maxLatitude = latitudes.max(),
+              let minLongitude = longitudes.min(), let maxLongitude = longitudes.max() else { return [] }
+        let latitudePadding = corridorMeters / 100_000 + 0.001
+        let edgeLatitude = min(89.999, max(abs(minLatitude), abs(maxLatitude)) + latitudePadding)
+        let longitudePadding = min(180, corridorMeters / (100_000 * cos(edgeLatitude * .pi / 180)) + 0.001)
+        let checkLongitude = minLongitude > -180 + longitudePadding && maxLongitude < 180 - longitudePadding
+        var matches: [RouteStopCandidate] = []
+        for station in compatibleStations {
+            if isCancelled() { return [] }
+            let coordinate = station.coordinate
+            guard coordinate.latitude >= minLatitude - latitudePadding,
+                  coordinate.latitude <= maxLatitude + latitudePadding,
+                  !checkLongitude || (coordinate.longitude >= minLongitude - longitudePadding &&
+                                      coordinate.longitude <= maxLongitude + longitudePadding) else { continue }
+            guard let match = nearestPoint(to: station.coordinate, on: route, isCancelled: isCancelled),
+                  match.distance <= corridorMeters else { continue }
+            matches.append(RouteStopCandidate(station: station, offRouteMeters: match.distance, routeProgressMeters: match.progress))
         }
-        .sorted {
+        return matches.sorted {
             if $0.routeProgressMeters != $1.routeProgressMeters { return $0.routeProgressMeters < $1.routeProgressMeters }
             return $0.station.id < $1.station.id
         }
     }
 
-    private static func nearestPoint(to coordinate: Coordinate, on route: [Coordinate]) -> (distance: Double, progress: Double)? {
+    private static func nearestPoint(to coordinate: Coordinate, on route: [Coordinate], isCancelled: () -> Bool) -> (distance: Double, progress: Double)? {
         let earthRadius = 6_371_000.0
         guard route.count > 1 else {
             let point = route[0]
@@ -304,6 +338,7 @@ enum RouteStopMatcher {
         var routeProgress = 0.0
         var nearest: (distance: Double, progress: Double)?
         for index in 0..<(route.count - 1) {
+            if index.isMultiple(of: 64), isCancelled() { return nil }
             let start = route[index]
             let end = route[index + 1]
             let meanLatitude = (start.latitude + end.latitude + coordinate.latitude) / 3 * .pi / 180

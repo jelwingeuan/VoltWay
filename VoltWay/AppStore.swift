@@ -11,6 +11,8 @@ final class VoltWayStore {
     private(set) var stations: [ChargingStation]
     private var compatibleResultRevision = 0
     private(set) var favorites: [FavoriteStation] = []
+    private(set) var favoriteStationIDs: Set<String> = []
+    private(set) var favoriteStations: [ChargingStation] = []
     private(set) var currentLocation: Coordinate?
     private(set) var lastSuccessfulStationFetchAt: Date?
     private(set) var catalogSyncedAt: Date?
@@ -38,6 +40,7 @@ final class VoltWayStore {
     @ObservationIgnored private var compatibleSortDate = Date.distantPast
     @ObservationIgnored private var nextCompatibleStatusActivation: Date?
     @ObservationIgnored private var nextCompatibleStatusExpiry: Date?
+    @ObservationIgnored private var favoriteSourceIDsByStationID: [String: Set<String>] = [:]
 
     init(configuration: AppConfiguration = .current, backend: BackendClient? = nil) {
         self.backend = backend ?? BackendClient(configuration: configuration)
@@ -62,20 +65,6 @@ final class VoltWayStore {
 
     var hasTimedStationFacts: Bool {
         stations.contains { $0.availability.lastUpdated != nil || $0.price?.lastUpdated != nil }
-    }
-
-    var favoriteStationIDs: Set<String> {
-        Set(favorites.map(\.stationID))
-    }
-
-    var favoriteStations: [ChargingStation] {
-        return favorites.compactMap { favorite in
-            if let current = stations.first(where: { $0.id == favorite.stationID }) { return current }
-            // A directory snapshot cannot prove a site is still public or licensed after it leaves the catalog.
-            return favorite.stationSnapshot.source == .openChargeMap || favorite.stationSnapshot.source == .mevnet || favorite.stationSnapshot.source == .ownerProvided
-                || favorite.stationID.hasPrefix("ocm:") || favorite.stationID.hasPrefix("mevnet:") || favorite.stationID.hasPrefix("private:")
-                ? nil : favorite.stationSnapshot
-        }
     }
 
     var profileSummary: String {
@@ -188,6 +177,7 @@ final class VoltWayStore {
         isLoadingAccountData = false
         accountDataNeedsRetry = false
         favorites = []
+        rebuildFavorites()
         currentLocation = nil
         cachedCompatibleStations = []
         compatibleSortDate = .distantPast
@@ -226,6 +216,7 @@ final class VoltWayStore {
                   stationRefreshRevision == refreshRevision else { return }
             stations = result.stations
             rebuildCompatibleStations()
+            rebuildFavorites()
             sourceWarnings = result.warnings ?? []
             catalogSyncedAt = result.catalogSyncedAt
             catalogImportReport = result.catalogImportReport
@@ -421,23 +412,30 @@ final class VoltWayStore {
         let accountRevision = accountRevision
         let userID = session?.userID
         let previous = favorites
-        if favoriteStationIDs.contains(station.id) {
-            favorites.removeAll { $0.stationID == station.id }
+        let savedIDs = Set(previous.map(\.stationID))
+        let matchingIDs = favoriteSourceIDsByStationID[station.id, default: []]
+            .union(Self.stationIdentityIDs(station).filter { savedIDs.contains($0) })
+        if !matchingIDs.isEmpty {
+            favorites.removeAll { matchingIDs.contains($0.stationID) }
         } else {
             favorites.append(FavoriteStation(userID: session?.userID, stationID: station.id, stationSnapshot: station, createdAt: .now))
         }
+        rebuildFavorites()
         persistCarPlaySnapshot()
 
         guard let session else { return }
         do {
-            if previous.contains(where: { $0.stationID == station.id }) {
-                try await backend.deleteFavorite(stationID: station.id, session: session)
+            if !matchingIDs.isEmpty {
+                for stationID in matchingIDs {
+                    try await backend.deleteFavorite(stationID: stationID, session: session)
+                }
             } else {
                 try await backend.saveFavorite(station, session: session)
             }
         } catch {
             guard isCurrentAccount(accountRevision, userID: userID) else { return }
             favorites = previous
+            rebuildFavorites()
             persistCarPlaySnapshot()
             show(error)
         }
@@ -487,6 +485,7 @@ final class VoltWayStore {
         profile = selected ?? VehicleProfile(userID: session.userID, connectors: [], minimumPowerKW: nil)
         rebuildCompatibleStations()
         favorites = loadedFavoritesResult
+        rebuildFavorites()
         // The account is usable before the independent charger catalog finishes loading.
         accountDataNeedsRetry = false
         isLoadingAccountData = false
@@ -522,6 +521,65 @@ final class VoltWayStore {
 
     private func isCurrentAccount(_ revision: Int, userID: String?) -> Bool {
         accountRevision == revision && session?.userID == userID
+    }
+
+    private static func stationIdentityIDs(_ station: ChargingStation) -> Set<String> {
+        var ids: Set<String> = [station.id]
+        for key in ["openChargeMap", "ocm"] {
+            if let id = station.sourceIDs?[key], !id.isEmpty {
+                ids.insert(id.hasPrefix("ocm:") ? id : "ocm:\(id)")
+            }
+        }
+        if let id = station.sourceIDs?["mevnet"], !id.isEmpty {
+            ids.insert(id.hasPrefix("mevnet:") ? id : "mevnet:\(id)")
+        }
+        if let id = station.sourceIDs?["gentari"], !id.isEmpty { ids.insert(id) }
+        return ids
+    }
+
+    private func rebuildFavorites() {
+        guard !favorites.isEmpty else {
+            favoriteStationIDs = []
+            favoriteStations = []
+            favoriteSourceIDsByStationID = [:]
+            return
+        }
+
+        var stationIndexByID: [String: Int] = [:]
+        stationIndexByID.reserveCapacity(stations.count * 2)
+        for (index, station) in stations.enumerated() where stationIndexByID[station.id] == nil {
+            stationIndexByID[station.id] = index
+        }
+        for (index, station) in stations.enumerated() {
+            for id in Self.stationIdentityIDs(station) where stationIndexByID[id] == nil {
+                stationIndexByID[id] = index
+            }
+        }
+
+        var ids = Set(favorites.map(\.stationID))
+        var visible: [ChargingStation] = []
+        var visibleIDs: Set<String> = []
+        var sourceIDsByStationID: [String: Set<String>] = [:]
+        for favorite in favorites {
+            if let index = stationIndexByID[favorite.stationID] {
+                let current = stations[index]
+                ids.insert(current.id)
+                sourceIDsByStationID[current.id, default: []].insert(favorite.stationID)
+                if visibleIDs.insert(current.id).inserted { visible.append(current) }
+            } else {
+                sourceIDsByStationID[favorite.stationID, default: []].insert(favorite.stationID)
+                // A directory snapshot cannot prove a site is still public or licensed after it leaves the catalog.
+                let snapshot = favorite.stationSnapshot
+                if snapshot.source != .openChargeMap && snapshot.source != .mevnet && snapshot.source != .ownerProvided
+                    && !favorite.stationID.hasPrefix("ocm:") && !favorite.stationID.hasPrefix("mevnet:") && !favorite.stationID.hasPrefix("private:")
+                    && visibleIDs.insert(snapshot.id).inserted {
+                    visible.append(snapshot)
+                }
+            }
+        }
+        favoriteStationIDs = ids
+        favoriteStations = visible
+        favoriteSourceIDsByStationID = sourceIDsByStationID
     }
 
     private func persistCarPlaySnapshot() {

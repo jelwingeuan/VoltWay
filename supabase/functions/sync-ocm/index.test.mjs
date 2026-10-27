@@ -162,3 +162,35 @@ test("Import accounts for every fetched record without silently losing unknown c
     });
   } finally { globalThis.fetch = originalFetch; }
 });
+
+test("a complete import that now excludes every site clears the prior public snapshot", async () => {
+  const originalFetch = globalThis.fetch;
+  let written;
+  globalThis.fetch = async (url, options) => {
+    if (String(url).includes("openchargemap.io")) return Number(new URL(url).searchParams.get("greaterthanid")) > 0
+      ? Response.json([])
+      : Response.json([{ ID: 42, DataProviderID: 1, UsageTypeID: 2 }]);
+    written = JSON.parse(options.body);
+    return new Response(null, { status: 201 });
+  };
+  try {
+    assert.equal((await handler(request())).status, 200);
+    assert.deepEqual(written.stations, []);
+    assert.equal(written.import_report.fetched, 1);
+    assert.deepEqual(written.import_report.excludedIDs.private, [42]);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test("a source with no records does not replace the previous snapshot", async () => {
+  const originalFetch = globalThis.fetch;
+  let writes = 0;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("openchargemap.io")) return Response.json([]);
+    writes++;
+    return new Response(null, { status: 201 });
+  };
+  try {
+    assert.equal((await handler(request())).status, 502);
+    assert.equal(writes, 0);
+  } finally { globalThis.fetch = originalFetch; }
+});

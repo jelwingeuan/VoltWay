@@ -22,7 +22,7 @@ Deno.serve(async (request) => {
 
   try {
     const { stations, report } = await downloadMalaysia(apiKey);
-    if (!stations.length) return reply(502, "Catalog sync returned no usable locations");
+    if (!report.fetched) return reply(502, "Catalog sync returned no source locations");
     const url = new URL(`${supabaseURL}/rest/v1/charger_catalog`);
     url.searchParams.set("on_conflict", "source");
     const saved = await fetch(url, {

@@ -1,6 +1,6 @@
 import { combineNationwide, filterStations, normalizeGentari, normalizePrivateSite, stationArray, type JSONObject, type Station } from "./shared.ts";
 
-const jsonHeaders = { "Content-Type": "application/json" };
+const jsonHeaders = { "Content-Type": "application/json", "Cache-Control": "no-store" };
 
 Deno.serve(async (request) => {
   if (request.method !== "GET") return response({ error: "Method not allowed" }, 405);
@@ -28,7 +28,8 @@ Deno.serve(async (request) => {
   }
 
   const [gentari, catalog, mevnet, privateSites] = await Promise.all([
-    fetchGentari(), readCatalog(supabaseURL, "open_charge_map"), readCatalog(supabaseURL, "mevnet"),
+    fetchGentari(), readCatalog(supabaseURL, "open_charge_map"),
+    Deno.env.get("MEVNET_REUSE_APPROVED") === "true" ? readCatalog(supabaseURL, "mevnet") : Promise.resolve(null),
     readPrivateSites(supabaseURL, supabaseAnonKey, authorization),
   ]);
   const combined = combineNationwide(gentari, catalog?.stations ?? null, mevnet?.stations ?? null);
@@ -48,7 +49,7 @@ Deno.serve(async (request) => {
     mevnetImportReport: mevnet?.importReport ?? null, duplicateCount: combined?.duplicateCount ?? 0,
     duplicateIDs: combined?.duplicateIDs ?? [], privateSiteCount: privateSites?.stations.length ?? 0 }), {
     status: 200,
-    headers: { ...jsonHeaders, "Cache-Control": "private, max-age=30" },
+    headers: jsonHeaders,
   });
 });
 
@@ -105,8 +106,9 @@ async function readCatalog(supabaseURL: string, source: "open_charge_map" | "mev
     if (!catalogResponse.ok) return null;
     const rows = await catalogResponse.json();
     const row = Array.isArray(rows) ? rows[0] : null;
-    if (!row || !Array.isArray(row.stations) || !row.stations.length || typeof row.synced_at !== "string") return null;
+    if (!row || !Array.isArray(row.stations) || typeof row.synced_at !== "string") return null;
     const report = row.import_report;
+    if (!row.stations.length && !(report && typeof report.fetched === "number" && report.fetched > 0 && report.included === 0)) return null;
     return { stations: row.stations, syncedAt: row.synced_at,
       importReport: report && typeof report.fetched === "number" ? report : null };
   } catch {

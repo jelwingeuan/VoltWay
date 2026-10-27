@@ -2,15 +2,14 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 let handler;
+const environment = {
+  SUPABASE_URL: "https://voltway.test",
+  SUPABASE_ANON_KEY: "public-anon-key",
+  SUPABASE_SERVICE_ROLE_KEY: "private-service-key",
+};
 globalThis.Deno = {
   serve: (callback) => { handler = callback; },
-  env: {
-    get: (key) => ({
-      SUPABASE_URL: "https://voltway.test",
-      SUPABASE_ANON_KEY: "public-anon-key",
-      SUPABASE_SERVICE_ROLE_KEY: "private-service-key",
-    })[key],
-  },
+  env: { get: (key) => environment[key] },
 };
 await import("./index.ts");
 
@@ -46,7 +45,9 @@ test("Authenticated search serves cached open data when Gentari is unavailable",
     assert.equal(data.warnings.length, 2);
     assert.equal(data.catalogImportReport, null);
     assert.deepEqual(data.duplicateIDs, []);
-    assert.equal(upstream.length, 4);
+    assert.equal(response.headers.get("Cache-Control"), "no-store");
+    assert.equal(upstream.length, 3);
+    assert.ok(upstream.every((url) => !url.includes("source=eq.mevnet")));
     assert.ok(upstream.every((url) => !url.includes("latitude") && !url.includes("longitude")));
   } finally {
     globalThis.fetch = originalFetch;
@@ -84,6 +85,63 @@ test("Private station reads use the signed-in JWT so database RLS can filter inv
     assert.equal(data.stations[0].access, "private");
     assert.equal(data.stations[0].availability.state, "unknown");
     assert.equal(data.stations[0].price, null);
+    assert.equal(response.headers.get("Cache-Control"), "no-store");
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test("MEVnet snapshots are served only while reuse approval is active", async () => {
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (url) => {
+    requests.push(String(url));
+    if (String(url).includes("/auth/v1/user")) return Response.json({ id: "user-1" });
+    if (String(url).includes("/private_charger_sites")) return Response.json([]);
+    if (String(url).includes("source=eq.open_charge_map")) return Response.json([]);
+    if (String(url).includes("source=eq.mevnet")) return Response.json([{
+      stations: [{ id: "mevnet:1", name: "Planning site", address: "Selangor", operatorName: "Network unavailable",
+        coordinate: { latitude: 3.14, longitude: 101.68 }, connectors: [],
+        availability: { state: "unknown", availableConnectors: null, totalConnectors: null, lastUpdated: null },
+        price: null, source: "mevnet" }],
+      synced_at: new Date().toISOString(), import_report: { fetched: 1, included: 1 },
+    }]);
+    return new Response("Unavailable", { status: 503 });
+  };
+  try {
+    environment.MEVNET_REUSE_APPROVED = "true";
+    const approved = await handler(request());
+    assert.equal(approved.status, 200);
+    assert.deepEqual((await approved.json()).stations.map((station) => station.id), ["mevnet:1"]);
+    assert.ok(requests.some((url) => url.includes("source=eq.mevnet")));
+
+    requests.length = 0;
+    delete environment.MEVNET_REUSE_APPROVED;
+    const revoked = await handler(request());
+    assert.equal(revoked.status, 502);
+    assert.equal(revoked.headers.get("Cache-Control"), "no-store");
+    assert.ok(requests.every((url) => !url.includes("source=eq.mevnet")));
+  } finally {
+    delete environment.MEVNET_REUSE_APPROVED;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("a validated zero-eligible catalog is available without resurrecting prior sites", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("/auth/v1/user")) return Response.json({ id: "user-1" });
+    if (String(url).includes("/private_charger_sites")) return Response.json([]);
+    if (String(url).includes("source=eq.open_charge_map")) return Response.json([{
+      stations: [], synced_at: new Date().toISOString(),
+      import_report: { fetched: 2, included: 0, private: 1, invalid: 0, license: 1 },
+    }]);
+    return new Response("Unavailable", { status: 503 });
+  };
+  try {
+    const result = await handler(request());
+    const data = await result.json();
+    assert.equal(result.status, 200);
+    assert.deepEqual(data.stations, []);
+    assert.equal(data.catalogImportReport.included, 0);
   } finally { globalThis.fetch = originalFetch; }
 });
 

@@ -13,7 +13,6 @@ Deno.serve(async (request) => {
   if (!supabaseURL || !serviceKey) return reply(503, "Catalog sync is not configured");
   try {
     const { stations, report } = await downloadMEVnet();
-    if (!stations.length) throw new Error("Empty catalog");
     const url = new URL(`${supabaseURL}/rest/v1/charger_catalog`);
     url.searchParams.set("on_conflict", "source");
     const saved = await fetch(url, {
@@ -32,11 +31,16 @@ Deno.serve(async (request) => {
 });
 
 export async function downloadMEVnet(): Promise<{ stations: Station[]; report: Record<string, unknown> }> {
-  const countURL = new URL(layerURL);
-  countURL.search = new URLSearchParams({ f: "json", where: "1=1", returnCountOnly: "true" }).toString();
-  const countResult = await readJSON(countURL);
-  if (!Number.isSafeInteger(countResult.count) || (countResult.count as number) <= 0) throw new Error("Invalid count");
-  const expected = countResult.count as number;
+  // Fix the source ID set before reading features so edits cannot shift offset pages.
+  const idsURL = new URL(layerURL);
+  idsURL.search = new URLSearchParams({ f: "json", where: "1=1", returnIdsOnly: "true" }).toString();
+  const idsResult = await readJSON(idsURL);
+  if (!Array.isArray(idsResult.objectIds) || !idsResult.objectIds.length || idsResult.objectIds.some((id) =>
+    typeof id !== "number" || !Number.isSafeInteger(id) || id <= 0
+  )) throw new Error("Invalid object IDs");
+  const expectedIDs = (idsResult.objectIds as number[]).sort((a, b) => a - b);
+  if (new Set(expectedIDs).size !== expectedIDs.length) throw new Error("Duplicate object IDs");
+  const expected = expectedIDs.length;
   const stations: Station[] = [];
   const excludedIDs: number[] = [];
   const privateIDs: number[] = [];
@@ -46,22 +50,30 @@ export async function downloadMEVnet(): Promise<{ stations: Station[]; report: R
   let fetched = 0;
   let previousID = 0;
   let proposed = 0;
-  for (let offset = 0; offset < expected + pageSize; offset += pageSize) {
-    const url = new URL(layerURL);
-    url.search = new URLSearchParams({ f: "json", where: "1=1", outFields: "*", returnGeometry: "false",
-      orderByFields: "objectid ASC", resultOffset: String(offset), resultRecordCount: String(pageSize) }).toString();
-    const result = await readJSON(url);
-    if (!Array.isArray(result.features) || typeof result.exceededTransferLimit !== "boolean") throw new Error("Invalid page");
+  for (let offset = 0; offset < expected; offset += pageSize) {
+    const batch = expectedIDs.slice(offset, offset + pageSize);
+    // A form body avoids ArcGIS GET URL limits for a full batch of object IDs.
+    const parameters = new URLSearchParams({ f: "json", objectIds: batch.join(","), outFields: "*",
+      returnGeometry: "false", orderByFields: "objectid ASC" });
+    const result = await readJSON(new URL(layerURL), { method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: parameters.toString() });
+    if (!Array.isArray(result.features) || (result.exceededTransferLimit !== undefined &&
+        typeof result.exceededTransferLimit !== "boolean")) throw new Error("Invalid page");
     const features = result.features;
-    if (features.length === 0) {
-      if (fetched !== expected) throw new Error("Incomplete page sequence");
-      break;
-    }
+    if (result.exceededTransferLimit === true || features.length !== batch.length) throw new Error("Incomplete object ID batch");
+    const expectedBatch = new Set(batch);
+    const featuresByID = new Map<number, JSONObject>();
     for (const feature of features) {
       if (!isObject(feature) || !isObject(feature.attributes)) throw new Error("Invalid feature");
-      const attributes = feature.attributes;
-      const id = attributes.objectid;
-      if (typeof id !== "number" || !Number.isSafeInteger(id) || id <= previousID || seen.has(id)) throw new Error("Nonadvancing page");
+      const id = feature.attributes.objectid;
+      if (typeof id !== "number" || !Number.isSafeInteger(id) || !expectedBatch.has(id) || featuresByID.has(id)) {
+        throw new Error("Unexpected object ID");
+      }
+      featuresByID.set(id, feature);
+    }
+    for (const id of batch) {
+      const attributes = featuresByID.get(id)?.attributes;
+      if (!isObject(attributes) || id <= previousID || seen.has(id)) throw new Error("Unexpected object ID");
       seen.add(id);
       previousID = id;
       fetched++;
@@ -80,11 +92,6 @@ export async function downloadMEVnet(): Promise<{ stations: Station[]; report: R
       else { excludedIDs.push(id); tally.invalid++; }
       states[state] = tally;
     }
-    if (fetched > expected) throw new Error("Count changed during import");
-    if (!result.exceededTransferLimit) {
-      if (fetched !== expected) throw new Error("Incomplete final page");
-      break;
-    }
   }
   if (fetched !== expected || stations.length + excludedIDs.length + privateIDs.length + accessUnverifiedIDs.length !== fetched ||
       Object.values(states).reduce((sum, state) => sum + state.fetched, 0) !== fetched ||
@@ -95,8 +102,8 @@ export async function downloadMEVnet(): Promise<{ stations: Station[]; report: R
     excludedIDs: { invalid: excludedIDs, private: privateIDs, accessUnverified: accessUnverifiedIDs }, states } };
 }
 
-async function readJSON(url: URL): Promise<JSONObject> {
-  const response = await fetch(url, { signal: AbortSignal.timeout(20_000) });
+async function readJSON(url: URL, options: RequestInit = {}): Promise<JSONObject> {
+  const response = await fetch(url, { ...options, signal: AbortSignal.timeout(20_000) });
   if (!response.ok) throw new Error("MEVnet request failed");
   const value: unknown = await response.json();
   if (!isObject(value) || value.error) throw new Error("MEVnet returned an error");
