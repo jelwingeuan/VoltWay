@@ -57,7 +57,7 @@ test("MEVnet keeps AC/DC counts separate from verified connectors and rejects in
   assert.equal(Object.keys(allNetworks.networkCounts).length, 27);
 });
 
-test("nationwide merge keeps Gentari ID and status, OCM connectors, and MEVnet lifecycle", () => {
+test("nationwide merge keeps Gentari ID and status plus MEVnet lifecycle", () => {
   const partner = normalizeGentari({ id: "favorite-id", name: "City Mall", latitude: 3.14, longitude: 101.68,
     connectors: [{ kind: "CCS2", powerKW: 120 }], availability: { status: "available" } });
   const directory = normalizeOpenChargeMap(ocm());
@@ -97,7 +97,7 @@ test("a proposed planning row cannot hide a live charger at the same named site"
   assert.equal(result.stations[1].availability.state, "unknown");
 });
 
-test("OCM enriches a matching Gentari site without replacing partner connector facts", () => {
+test("OCM enriches a matching Gentari site without adding unverified connector kinds", () => {
   const partner = normalizeGentari({ id: "partner-site", name: "City Mall", latitude: 3.14, longitude: 101.68,
     connectors: [{ kind: "CCS2", powerKW: 150, count: 1 }] });
   const directory = normalizeOpenChargeMap(ocm({ UsageType: { ID: 1, Title: "Public", IsPublicAccess: true } }));
@@ -105,11 +105,37 @@ test("OCM enriches a matching Gentari site without replacing partner connector f
   assert.equal(merged.length, 1);
   assert.equal(merged[0].id, "partner-site");
   assert.equal(merged[0].access, "public");
-  assert.deepEqual(merged[0].connectors, [
-    { kind: "ccs2", powerKW: 150, count: 1 },
-    { kind: "type2", powerKW: null, count: null },
-  ]);
-  assert.deepEqual(filterStations(merged, new Set(["type2"]), 0).map((station) => station.id), ["partner-site"]);
+  assert.deepEqual(merged[0].connectors, [{ kind: "ccs2", powerKW: 150, count: 1 }]);
+  assert.deepEqual(filterStations(merged, new Set(["type2"]), 0), []);
+});
+
+test("directory-only connector cannot inherit a partner site's fresh availability", () => {
+  const lastUpdated = new Date().toISOString();
+  const partner = normalizeGentari({ id: "live-ccs2", name: "City Mall", latitude: 3.14, longitude: 101.68,
+    connectors: [{ kind: "CCS2", powerKW: 150, count: 2 }],
+    availability: { status: "available", available_connectors: 1, total_connectors: 2, last_updated: lastUpdated } });
+  const directory = normalizeOpenChargeMap(ocm({
+    Connections: [{ ConnectionTypeID: 25, PowerKW: 22, Quantity: 4 }],
+  }));
+  const merged = combineNationwide([partner], [directory], null);
+  assert.equal(merged.stations.length, 1);
+  assert.equal(merged.stations[0].id, "live-ccs2");
+  assert.deepEqual(merged.stations[0].connectors, [{ kind: "ccs2", powerKW: 150, count: 2 }]);
+  assert.deepEqual(merged.stations[0].availability, {
+    state: "available", availableConnectors: 1, totalConnectors: 2, lastUpdated,
+  });
+  assert.deepEqual(merged.stations[0].sourceIDs, { gentari: "live-ccs2", openChargeMap: "ocm:42" });
+  assert.deepEqual(merged.stations[0].sourceAttributions, ["Gentari partner feed", "Open Charge Map · CC BY 4.0"]);
+  assert.deepEqual(filterStations(merged.stations, new Set(["type2"]), 0), []);
+
+  const unmatched = normalizeOpenChargeMap(ocm({
+    ID: 43,
+    AddressInfo: { ...ocm().AddressInfo, Title: "Other Mall", Latitude: 3.2 },
+    Connections: [{ ConnectionTypeID: 25, PowerKW: 22, Quantity: 4 }],
+  }));
+  const directoryOnly = combineNationwide([partner], [unmatched], null);
+  assert.deepEqual(filterStations(directoryOnly.stations, new Set(["type2"]), 0).map((station) => station.id), ["ocm:43"]);
+  assert.equal(directoryOnly.stations[1].availability.state, "unknown");
 });
 
 test("OCM imports contributor locations but never directory status or price", () => {

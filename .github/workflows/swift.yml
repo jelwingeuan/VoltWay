@@ -1,7 +1,4 @@
-# This workflow will build a Swift project
-# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-swift
-
-name: Swift
+name: VoltWay tests
 
 on:
   push:
@@ -10,13 +7,19 @@ on:
     branches: [ "main" ]
 
 jobs:
-  build:
-
-    runs-on: macos-latest
+  test:
+    runs-on: xcode-27
 
     steps:
     - uses: actions/checkout@v4
-    - name: Build
-      run: swift build -v
-    - name: Run tests
-      run: swift test -v
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '24'
+    - name: Inspect Xcode and simulators
+      run: |
+        xcodebuild -version
+        xcrun simctl list devices available
+    - name: Run iOS tests
+      run: xcodebuild -project VoltWay.xcodeproj -scheme VoltWay -destination 'platform=iOS Simulator,name=iPhone 18 Pro' CODE_SIGNING_ALLOWED=NO test
+    - name: Run backend tests
+      run: node --test supabase/functions/stations/*.test.mjs supabase/functions/sync-ocm/*.test.mjs supabase/functions/sync-mevnet/*.test.mjs

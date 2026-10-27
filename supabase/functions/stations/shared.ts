@@ -330,11 +330,15 @@ export function combineNationwide(gentari: Station[] | null, openChargeMap: Stat
     const sourceIDs = { ...(existing.sourceIDs ?? { [existing.source]: existing.id }), ...(incoming.sourceIDs ?? { [incoming.source]: incoming.id }) };
     const sourceAttributions = [...new Set([...(existing.sourceAttributions ?? [existing.sourceAttribution ?? existing.source]),
       ...(incoming.sourceAttributions ?? [incoming.sourceAttribution ?? incoming.source])])];
+    // A directory-only connector cannot inherit Gentari's site-wide live availability.
+    const connectors = existing.source === "gentari" && incoming.source !== "gentari"
+      ? existing.connectors
+      : [...existing.connectors, ...incoming.connectors.filter((connector) =>
+        !existing.connectors.some((current) => current.kind === connector.kind))];
     // Source order is Gentari, OCM, MEVnet. Preserve the first stable ID and all trusted enriched facts.
     stations[index] = { ...existing, sourceIDs, sourceAttributions,
       sourceAttribution: sourceAttributions.join(" · "),
-      connectors: [...existing.connectors, ...incoming.connectors.filter((connector) =>
-        !existing.connectors.some((current) => current.kind === connector.kind))],
+      connectors,
       address: existing.address !== "Address unavailable" ? existing.address : incoming.address,
       state: incoming.source === "mevnet" ? incoming.state : existing.state,
       sourceSequence: incoming.source === "mevnet" ? incoming.sourceSequence : existing.sourceSequence,
