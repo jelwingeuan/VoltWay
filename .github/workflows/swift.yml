@@ -19,7 +19,14 @@ jobs:
       run: |
         xcodebuild -version
         xcrun simctl list devices available
-    - name: Run iOS tests
-      run: xcodebuild -project VoltWay.xcodeproj -scheme VoltWay -destination 'platform=iOS Simulator,name=iPhone 18 Pro' CODE_SIGNING_ALLOWED=NO test
     - name: Run backend tests
       run: node --test supabase/functions/stations/*.test.mjs supabase/functions/sync-ocm/*.test.mjs supabase/functions/sync-mevnet/*.test.mjs
+    - name: Run iOS tests
+      run: xcodebuild -project VoltWay.xcodeproj -scheme VoltWay -destination 'platform=iOS Simulator,name=iPhone 18 Pro' -parallel-testing-enabled NO -resultBundlePath "$RUNNER_TEMP/VoltWay.xcresult" CODE_SIGNING_ALLOWED=NO test
+    - name: Preserve iOS test diagnostics
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: ios-test-results
+        path: ${{ runner.temp }}/VoltWay.xcresult
+        if-no-files-found: ignore

@@ -248,7 +248,8 @@ actor BackendClient {
     }
 
     func saveFavorite(_ station: ChargingStation, session: UserSession) async throws {
-        let favorite = FavoriteStation(userID: session.userID, stationID: station.id, stationSnapshot: station, createdAt: .now)
+        let snapshot = station.id.hasPrefix("private:") || station.source == .ownerProvided ? nil : station
+        let favorite = FavoriteStation(userID: session.userID, stationID: station.id, stationSnapshot: snapshot, createdAt: .now)
         let _: EmptyResponse = try await request(
             path: "rest/v1/favorite_stations",
             method: "POST",

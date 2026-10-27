@@ -508,16 +508,54 @@ enum CatalogCoverage {
 struct FavoriteStation: Codable, Equatable, Identifiable, Sendable {
     let userID: String?
     let stationID: String
-    let stationSnapshot: ChargingStation
+    let stationSnapshot: ChargingStation?
     let createdAt: Date?
 
     var id: String { stationID }
+
+    init(userID: String?, stationID: String, stationSnapshot: ChargingStation?, createdAt: Date?) {
+        self.userID = userID
+        self.stationID = stationID
+        self.stationSnapshot = Self.safeSnapshot(stationSnapshot, stationID: stationID)
+        self.createdAt = createdAt
+    }
 
     enum CodingKeys: String, CodingKey {
         case userID = "user_id"
         case stationID = "station_id"
         case stationSnapshot = "station_snapshot"
         case createdAt = "created_at"
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        let stationID = try values.decode(String.self, forKey: .stationID)
+        self.init(
+            userID: try values.decodeIfPresent(String.self, forKey: .userID),
+            stationID: stationID,
+            stationSnapshot: stationID.hasPrefix("private:") ? nil
+                : try values.decodeIfPresent(ChargingStation.self, forKey: .stationSnapshot),
+            createdAt: try values.decodeIfPresent(Date.self, forKey: .createdAt)
+        )
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encodeIfPresent(userID, forKey: .userID)
+        try values.encode(stationID, forKey: .stationID)
+        if let stationSnapshot {
+            try values.encode(stationSnapshot, forKey: .stationSnapshot)
+        } else {
+            // An explicit null also clears an older snapshot when PostgREST upserts this row.
+            try values.encodeNil(forKey: .stationSnapshot)
+        }
+        try values.encodeIfPresent(createdAt, forKey: .createdAt)
+    }
+
+    private static func safeSnapshot(_ snapshot: ChargingStation?, stationID: String) -> ChargingStation? {
+        guard !stationID.hasPrefix("private:"), snapshot?.source != .ownerProvided,
+              snapshot?.id.hasPrefix("private:") != true else { return nil }
+        return snapshot
     }
 }
 

@@ -421,7 +421,8 @@ final class VoltWayStore {
         if !matchingIDs.isEmpty {
             favorites.removeAll { matchingIDs.contains($0.stationID) }
         } else {
-            favorites.append(FavoriteStation(userID: session?.userID, stationID: station.id, stationSnapshot: station, createdAt: .now))
+            let snapshot = station.id.hasPrefix("private:") || station.source == .ownerProvided ? nil : station
+            favorites.append(FavoriteStation(userID: session?.userID, stationID: station.id, stationSnapshot: snapshot, createdAt: .now))
         }
         rebuildFavorites()
         persistCarPlaySnapshot()
@@ -596,8 +597,8 @@ final class VoltWayStore {
             } else {
                 sourceIDsByStationID[favorite.stationID, default: []].insert(favorite.stationID)
                 // A directory snapshot cannot prove a site is still public or licensed after it leaves the catalog.
-                let snapshot = favorite.stationSnapshot
-                if snapshot.source != .openChargeMap && snapshot.source != .mevnet && snapshot.source != .ownerProvided
+                if let snapshot = favorite.stationSnapshot,
+                    snapshot.source != .openChargeMap && snapshot.source != .mevnet && snapshot.source != .ownerProvided
                     && !favorite.stationID.hasPrefix("ocm:") && !favorite.stationID.hasPrefix("mevnet:") && !favorite.stationID.hasPrefix("private:")
                     && visibleIDs.insert(snapshot.id).inserted {
                     visible.append(snapshot)

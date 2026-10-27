@@ -521,7 +521,49 @@ struct VoltWayTests {
 
         let decoded = try decoder.decode(FavoriteStation.self, from: encoder.encode(favorite))
         #expect(decoded.id == "favorite")
-        #expect(decoded.stationSnapshot.id == favorite.stationSnapshot.id)
+        #expect(decoded.stationSnapshot?.id == favorite.stationSnapshot?.id)
+    }
+
+    @Test("Private favorites encode an explicit null instead of retaining a coordinate")
+    func privateFavoriteStoresOnlyID() throws {
+        let privateStation = ChargingStation(
+            id: "private:site-1", name: "Workplace depot", address: "Kuala Lumpur",
+            coordinate: Coordinate(latitude: 3.14, longitude: 101.68), operatorName: "Workplace",
+            connectors: [Connector(kind: .type2, powerKW: 22, count: 1)],
+            availability: Availability(state: .unknown, availableConnectors: nil, totalConnectors: nil, lastUpdated: nil),
+            price: nil, source: .ownerProvided, access: .privateAccess
+        )
+        let favorite = FavoriteStation(userID: "user-1", stationID: privateStation.id,
+                                       stationSnapshot: privateStation, createdAt: nil)
+        let object = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(favorite)) as? [String: Any])
+        #expect(object["station_id"] as? String == privateStation.id)
+        #expect(object["station_snapshot"] is NSNull)
+    }
+
+    @Test("Nullable private favorite rows decode and re-encode with an explicit null")
+    func nullablePrivateFavoriteDecoding() throws {
+        let nullable = Data(#"{"user_id":"user-1","station_id":"private:site-1","station_snapshot":null}"#.utf8)
+        let decoded = try JSONDecoder().decode(FavoriteStation.self, from: nullable)
+        let object = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(decoded)) as? [String: Any])
+        #expect(object["station_snapshot"] is NSNull)
+    }
+
+    @Test("Legacy private favorite snapshots are scrubbed when decoded")
+    func legacyPrivateFavoriteDecoding() throws {
+        let privateStation = ChargingStation(
+            id: "private:site-1", name: "Workplace depot", address: "Kuala Lumpur",
+            coordinate: Coordinate(latitude: 3.14, longitude: 101.68), operatorName: "Workplace",
+            connectors: [Connector(kind: .type2, powerKW: 22, count: 1)],
+            availability: Availability(state: .unknown, availableConnectors: nil, totalConnectors: nil, lastUpdated: nil),
+            price: nil, source: .ownerProvided, access: .privateAccess
+        )
+        let stationObject = try JSONSerialization.jsonObject(with: JSONEncoder().encode(privateStation))
+        let legacyData = try JSONSerialization.data(withJSONObject: [
+            "user_id": "user-1", "station_id": privateStation.id, "station_snapshot": stationObject
+        ])
+        let decoded = try JSONDecoder().decode(FavoriteStation.self, from: legacyData)
+        let object = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(decoded)) as? [String: Any])
+        #expect(object["station_snapshot"] is NSNull)
     }
 
     @Test("Old favorite snapshots without source metadata remain decodable")
@@ -1096,6 +1138,58 @@ struct BackendClientTests {
         await store.signOut()
     }
 
+    @Test("A revoked private site disappears from Saved and CarPlay without a cached coordinate")
+    @MainActor func revokedPrivateFavorite() async throws {
+        let privateStation = ChargingStation(
+            id: "private:site-1", name: "Workplace depot", address: "Kuala Lumpur",
+            coordinate: Coordinate(latitude: 3.14, longitude: 101.68), operatorName: "Workplace",
+            connectors: [Connector(kind: .type2, powerKW: 22, count: 1)],
+            availability: Availability(state: .unknown, availableConnectors: nil, totalConnectors: nil, lastUpdated: nil),
+            price: nil, source: .ownerProvided, access: .privateAccess
+        )
+        let encoder = JSONEncoder()
+        let profile = VehicleProfile(userID: "user-1", name: "City EV", connectors: [.type2], minimumPowerKW: nil)
+        let profileResponse = try encoder.encode([profile])
+        let visibleStations = Data(#"{"stations":"#.utf8) + (try encoder.encode([privateStation])) + Data("}".utf8)
+        let stationRequests = LockedCounter()
+        MockURLProtocol.handler = { request in
+            switch (request.url?.path, request.httpMethod) {
+            case ("/auth/v1/token", _):
+                return (200, Data(#"{"access_token":"fresh","refresh_token":"refresh-1","user":{"id":"user-1","email":"driver@example.com"}}"#.utf8))
+            case ("/rest/v1/favorite_stations", "GET"):
+                return (200, Data("[]".utf8))
+            case ("/rest/v1/favorite_stations", "POST"):
+                return (204, Data())
+            case ("/rest/v1/vehicle_profiles", "GET"):
+                return (200, profileResponse)
+            case ("/functions/v1/stations", _):
+                stationRequests.increment()
+                return (200, stationRequests.value == 1 ? visibleStations : Data(#"{"stations":[]}"#.utf8))
+            default:
+                return (200, Data("[]".utf8))
+            }
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let store = VoltWayStore(configuration: configuration, backend: makeClient(account: "test-\(UUID().uuidString)"))
+        await store.signIn(email: "driver@example.com", password: "password-123")
+        #expect(store.compatibleStations.map(\.id) == [privateStation.id])
+        #expect(CarPlaySnapshotStore.load().stations.isEmpty)
+        #expect(store.favoriteStations.isEmpty)
+        await store.toggleFavorite(privateStation)
+        #expect(store.favoriteStations.map(\.id) == [privateStation.id])
+        let favorite = try #require(store.favorites.first)
+        let savedObject = try #require(JSONSerialization.jsonObject(with: encoder.encode(favorite)) as? [String: Any])
+        #expect(savedObject["station_snapshot"] is NSNull)
+
+        await store.refreshStations()
+        #expect(store.compatibleStations.isEmpty)
+        #expect(store.favoriteStations.isEmpty)
+        #expect(CarPlaySnapshotStore.load().stations.isEmpty)
+        #expect(CarPlaySnapshotStore.load().favoriteStationIDs.isEmpty)
+        await store.signOut()
+    }
+
     @Test("Saved aliases use current catalog facts and remove their original favorite IDs")
     @MainActor func mergedFavoriteAliases() async throws {
         func station(_ id: String, name: String, source: StationSource) -> ChargingStation {
@@ -1289,6 +1383,37 @@ struct BackendClientTests {
             id: id, station: station, invitedEmail: "guest@example.com",
             session: session
         )
+        try await client.signOut()
+    }
+
+    @Test("Saving a private favorite POSTs its ID with an explicit null snapshot")
+    func privateFavoriteRequest() async throws {
+        let privateStation = ChargingStation(
+            id: "private:site-1", name: "Workplace depot", address: "Kuala Lumpur",
+            coordinate: Coordinate(latitude: 3.14, longitude: 101.68), operatorName: "Workplace",
+            connectors: [Connector(kind: .type2, powerKW: 22, count: 1)],
+            availability: Availability(state: .unknown, availableConnectors: nil, totalConnectors: nil, lastUpdated: nil),
+            price: nil, source: .ownerProvided, access: .privateAccess
+        )
+        let postCount = LockedCounter()
+        MockURLProtocol.handler = { request in
+            if request.url?.path == "/auth/v1/token" {
+                return (200, Data(#"{"access_token":"fresh","refresh_token":"refresh-1","user":{"id":"user-1","email":"driver@example.com"}}"#.utf8))
+            }
+            #expect(request.url?.path == "/rest/v1/favorite_stations")
+            #expect(request.httpMethod == "POST")
+            let body = try? JSONSerialization.jsonObject(with: request.httpBody ?? Data()) as? [String: Any]
+            #expect(body?["station_id"] as? String == privateStation.id)
+            #expect(body?["station_snapshot"] is NSNull)
+            postCount.increment()
+            return (204, Data())
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let client = makeClient(account: "test-\(UUID().uuidString)")
+        let session = try await client.signIn(email: "driver@example.com", password: "password-123")
+        try await client.saveFavorite(privateStation, session: session)
+        #expect(postCount.value == 1)
         try await client.signOut()
     }
 
