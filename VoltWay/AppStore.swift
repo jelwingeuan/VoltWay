@@ -9,7 +9,8 @@ final class VoltWayStore {
     private(set) var vehicles: [VehicleProfile]
     private(set) var activeVehicleID: UUID?
     private(set) var stations: [ChargingStation]
-    private var compatibleResultRevision = 0
+    private(set) var stationCatalogRevision = 0
+    private(set) var compatibleResultRevision = 0
     private(set) var favorites: [FavoriteStation] = []
     private(set) var favoriteStationIDs: Set<String> = []
     private(set) var favoriteStations: [ChargingStation] = []
@@ -171,6 +172,7 @@ final class VoltWayStore {
         }
         session = nil
         stations = []
+        stationCatalogRevision += 1
         vehicles = []
         activeVehicleID = nil
         profile = VehicleProfile(connectors: [], minimumPowerKW: nil)
@@ -215,6 +217,7 @@ final class VoltWayStore {
             guard isCurrentAccount(accountRevision, userID: requestedSession?.userID),
                   stationRefreshRevision == refreshRevision else { return }
             stations = result.stations
+            stationCatalogRevision += 1
             rebuildCompatibleStations()
             rebuildFavorites()
             sourceWarnings = result.warnings ?? []
@@ -426,18 +429,42 @@ final class VoltWayStore {
         guard let session else { return }
         do {
             if !matchingIDs.isEmpty {
-                for stationID in matchingIDs {
+                for stationID in matchingIDs.sorted() {
                     try await backend.deleteFavorite(stationID: stationID, session: session)
                 }
             } else {
                 try await backend.saveFavorite(station, session: session)
             }
         } catch {
+            let operationError = error
             guard isCurrentAccount(accountRevision, userID: userID) else { return }
-            favorites = previous
+            if !matchingIDs.isEmpty {
+                do {
+                    let confirmedFavorites = try await backend.loadFavorites(session: session)
+                    guard isCurrentAccount(accountRevision, userID: userID) else { return }
+                    favorites = confirmedFavorites
+                } catch {
+                    guard isCurrentAccount(accountRevision, userID: userID) else { return }
+                    // The DELETE may have committed despite its failed response; keep the prior
+                    // saved state until a fresh read can establish what actually remains.
+                    favorites = previous
+                    rebuildFavorites()
+                    persistCarPlaySnapshot()
+                    accountDataNeedsRetry = true
+                    errorMessage = "Saved chargers could not be verified. Reload account data to check them."
+                    return
+                }
+            } else {
+                favorites = previous
+            }
             rebuildFavorites()
             persistCarPlaySnapshot()
-            show(error)
+            if !matchingIDs.isEmpty && matchingIDs.isDisjoint(with: Set(favorites.map(\.stationID))) {
+                errorMessage = nil
+                noticeMessage = "Saved charger removed; confirmation was interrupted."
+            } else {
+                show(operationError)
+            }
         }
     }
 

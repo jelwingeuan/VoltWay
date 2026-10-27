@@ -191,9 +191,32 @@ struct DiscoverView: View {
         var id: Self { self }
     }
 
-    private struct Results {
-        let stations: [ChargingStation]
-        let networks: [String]
+    private typealias Results = DiscoveryResults
+
+    private struct CandidateKey: Equatable {
+        let showAllSites: Bool
+        let revision: Int
+    }
+
+    private struct QueryKey: Equatable {
+        let candidates: CandidateKey
+        let searchText: String
+        let availableNowOnly: Bool
+        let selectedNetwork: String?
+        let chargingType: ChargingType?
+        let minimumListedPowerKW: Double?
+        let accessFilter: StationAccess?
+        let includeProposed: Bool
+        let availabilityTime: Date?
+
+        var excludingTime: Self {
+            Self(
+                candidates: candidates, searchText: searchText, availableNowOnly: availableNowOnly,
+                selectedNetwork: selectedNetwork, chargingType: chargingType,
+                minimumListedPowerKW: minimumListedPowerKW, accessFilter: accessFilter,
+                includeProposed: includeProposed, availabilityTime: nil
+            )
+        }
     }
 
     let store: VoltWayStore
@@ -212,26 +235,33 @@ struct DiscoverView: View {
     @State private var selectedStationID: String?
     @State private var mapRecenterRequest: MapRecenterRequest?
     @State private var freshnessTime = Date.now
+    @State private var results = Results(stations: [], networks: [])
+    @State private var resultsCandidateKey: CandidateKey?
+    @State private var appliedFilterKey: QueryKey?
+    @State private var resultsRevision = UUID()
+    @State private var isFiltering = true
     @FocusState private var searchIsFocused: Bool
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
-    private var results: Results {
-        let candidates = showAllSites || includeProposed ? store.stations : store.compatibleStations
-        return Results(
-            stations: StationDiscovery.visibleStations(
-                from: candidates,
-                query: searchText,
-                availableNowOnly: availableNowOnly,
-                network: selectedNetwork,
-                profile: store.profile,
-                showAll: showAllSites,
-                chargingType: chargingType,
-                minimumListedPowerKW: minimumListedPowerKW,
-                access: accessFilter,
-                includeProposed: includeProposed,
-                now: freshnessTime
-            ),
-            networks: StationDiscovery.networks(from: candidates)
+    private var candidateKey: CandidateKey {
+        CandidateKey(
+            showAllSites: showAllSites,
+            revision: showAllSites ? store.stationCatalogRevision : store.compatibleResultRevision
+        )
+    }
+
+    private var queryKey: QueryKey {
+        QueryKey(
+            candidates: candidateKey,
+            searchText: searchText,
+            availableNowOnly: availableNowOnly,
+            selectedNetwork: selectedNetwork,
+            chargingType: chargingType,
+            minimumListedPowerKW: minimumListedPowerKW,
+            accessFilter: accessFilter,
+            includeProposed: showAllSites && includeProposed,
+            // Compatible ordering can change as partner status expires, even without the Available filter.
+            availabilityTime: (availableNowOnly || !showAllSites) ? freshnessTime : nil
         )
     }
 
@@ -301,16 +331,6 @@ struct DiscoverView: View {
             guard stationID != nil else { return }
             stationPreviewDetent = dynamicTypeSize.isAccessibilitySize ? .medium : compactStationPreviewDetent
         }
-        .onChange(of: discoveryResults.stations.map(\.id)) { _, stationIDs in
-            if let selectedStationID, !stationIDs.contains(selectedStationID) {
-                self.selectedStationID = nil
-            }
-        }
-        .onChange(of: discoveryResults.networks) { _, currentNetworks in
-            if let selectedNetwork, !currentNetworks.contains(selectedNetwork) {
-                self.selectedNetwork = nil
-            }
-        }
         .onChange(of: store.lastSuccessfulStationFetchAt) { _, _ in
             freshnessTime = .now
         }
@@ -326,6 +346,51 @@ struct DiscoverView: View {
         .task {
             if store.stations.isEmpty { await store.refreshStations() }
         }
+        .task(id: queryKey) {
+            await updateResults(for: queryKey)
+        }
+    }
+
+    private func updateResults(for key: QueryKey) async {
+        if appliedFilterKey != key.excludingTime { isFiltering = true }
+        if !key.searchText.isEmpty {
+            try? await Task.sleep(for: .milliseconds(150))
+        }
+        guard !Task.isCancelled else { return }
+        let candidates = key.candidates.showAllSites ? store.stations : store.compatibleStations
+        let filter = DiscoveryFilter(
+            query: key.searchText,
+            availableNowOnly: key.availableNowOnly,
+            network: key.selectedNetwork,
+            profile: store.profile,
+            showAll: key.candidates.showAllSites,
+            chargingType: key.chargingType,
+            minimumListedPowerKW: key.minimumListedPowerKW,
+            access: key.accessFilter,
+            includeProposed: key.includeProposed
+        )
+        let previousNetworks = resultsCandidateKey == key.candidates ? results.networks : nil
+        let updated = await StationDiscovery.resultsOffMain(
+            from: candidates,
+            filter: filter,
+            networkChoices: previousNetworks,
+            now: key.availabilityTime ?? freshnessTime
+        )
+        guard !Task.isCancelled, queryKey == key else { return }
+        if let selectedNetwork, !updated.networks.contains(selectedNetwork) {
+            self.selectedNetwork = nil
+            return
+        }
+        let mapStationsChanged = resultsCandidateKey != key.candidates
+            || !updated.stations.elementsEqual(results.stations, by: { $0.id == $1.id })
+        results = updated
+        resultsCandidateKey = key.candidates
+        appliedFilterKey = key.excludingTime
+        if mapStationsChanged { resultsRevision = UUID() }
+        isFiltering = false
+        if let selectedStationID, !updated.stations.contains(where: { $0.id == selectedStationID }) {
+            self.selectedStationID = nil
+        }
     }
 
     private func listContent(_ results: Results) -> some View {
@@ -333,7 +398,10 @@ struct DiscoverView: View {
             LazyVStack(alignment: .leading, spacing: 16) {
                 discoveryChrome(results)
 
-                if hasNoResults(in: results.stations) {
+                if isFiltering && results.stations.isEmpty {
+                    ProgressView("Finding chargers…")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } else if hasNoResults(in: results.stations) {
                     emptyResults
                 } else {
                     ForEach(results.stations) { station in
@@ -361,6 +429,7 @@ struct DiscoverView: View {
     private func mapContent(_ results: Results) -> some View {
         ChargerMapView(
             stations: results.stations,
+            resultsRevision: resultsRevision,
             freshnessTime: freshnessTime,
             recenterRequest: mapRecenterRequest,
             selectedStationID: $selectedStationID
@@ -381,6 +450,7 @@ struct DiscoverView: View {
             Form {
                 Section("Charger") {
                     Toggle("Show proposed sites in All sites", isOn: $includeProposed)
+                        .disabled(!showAllSites)
                     Text("Switch to All sites to see proposed MEVnet planning records. They are not confirmed open chargers.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
@@ -507,9 +577,9 @@ struct DiscoverView: View {
 
     private func resultsHeader(_ results: Results) -> some View {
         HStack {
-            Text("\(results.stations.count) sites · \(results.networks.count) networks")
+            Text(isFiltering ? "Finding chargers…" : "\(results.stations.count) sites · \(results.networks.count) networks")
                 .font(.caption.weight(.semibold))
-            if store.isLoadingStations {
+            if isFiltering || store.isLoadingStations {
                 Spacer()
                 ProgressView().controlSize(.small)
             }
@@ -553,7 +623,10 @@ struct DiscoverView: View {
                             displayButton(for: mode)
                         }
 
-                        Button(showAllSites ? "All sites" : "Compatible") { showAllSites.toggle() }
+                        Button(showAllSites ? "All sites" : "Compatible") {
+                            showAllSites.toggle()
+                            if !showAllSites { includeProposed = false }
+                        }
                             .buttonStyle(.glass)
                             .tint(.voltBlue)
                             .accessibilityHint("Switch between all directory sites and chargers matching your active vehicle")
@@ -658,7 +731,7 @@ struct DiscoverView: View {
 
     private func hasNoResults(in visibleStations: [ChargingStation]) -> Bool {
         (!showAllSites && store.profile.connectors.isEmpty)
-            || (!store.isLoadingStations && visibleStations.isEmpty)
+            || (!isFiltering && !store.isLoadingStations && visibleStations.isEmpty)
     }
 
     @ViewBuilder private var emptyResults: some View {
@@ -718,6 +791,7 @@ private struct MapRecenterRequest: Equatable {
 
 private struct ChargerMapView: UIViewRepresentable {
     let stations: [ChargingStation]
+    let resultsRevision: UUID
     let freshnessTime: Date
     let recenterRequest: MapRecenterRequest?
     @Binding var selectedStationID: String?
@@ -741,46 +815,20 @@ private struct ChargerMapView: UIViewRepresentable {
     }
 
     func updateUIView(_ map: MKMapView, context: Context) {
-        context.coordinator.parent = self
-        var seen = Set<String>()
-        let uniqueStations = stations.filter { seen.insert($0.id).inserted }
-        let current = Dictionary(map.annotations.compactMap { annotation in
-            (annotation as? ChargerAnnotation).map { ($0.stationID, $0) }
-        }, uniquingKeysWith: { first, _ in first })
-        let incoming = Set(uniqueStations.map(\.id))
-        let changedIDs = Set(uniqueStations.compactMap { station -> String? in
-            guard let annotation = current[station.id] else { return nil }
-            let coordinate = station.coordinate.coreLocation.coordinate
-            return annotation.coordinate.latitude != coordinate.latitude
-                || annotation.coordinate.longitude != coordinate.longitude
-                || annotation.title != station.networkName
-                || annotation.isProposed != (station.lifecycle == .proposed) ? station.id : nil
-        })
-        let selectedReplacementID = map.selectedAnnotations.compactMap { ($0 as? ChargerAnnotation)?.stationID }
-            .first { changedIDs.contains($0) }
-        map.removeAnnotations(current.values.filter { !incoming.contains($0.stationID) || changedIDs.contains($0.stationID) })
-        let additions = uniqueStations.filter { current[$0.id] == nil || changedIDs.contains($0.id) }.map {
-            ChargerAnnotation(station: $0, isAvailable: $0.availability.isReportedAvailable(at: freshnessTime))
+        let coordinator = context.coordinator
+        coordinator.parent = self
+        coordinator.updateAnnotationsIfNeeded(
+            on: map,
+            stations: stations,
+            resultsRevision: resultsRevision,
+            freshnessTime: freshnessTime
+        )
+        if !coordinator.hasFramed && !coordinator.annotationsByID.isEmpty {
+            coordinator.hasFramed = true
+            map.showAnnotations(Array(coordinator.annotationsByID.values), animated: false)
         }
-        map.addAnnotations(additions)
-        if let selectedReplacementID, let replacement = additions.first(where: { $0.stationID == selectedReplacementID }) {
-            map.selectAnnotation(replacement, animated: false)
-        }
-        for station in uniqueStations {
-            guard let annotation = current[station.id], !changedIDs.contains(station.id) else { continue }
-            let isAvailable = station.availability.isReportedAvailable(at: freshnessTime)
-            guard annotation.isAvailable != isAvailable else { continue }
-            annotation.isAvailable = isAvailable
-            if let view = map.view(for: annotation) as? MKMarkerAnnotationView {
-                view.markerTintColor = annotation.isAvailable ? UIColor(Color.voltMint) : UIColor(Color.voltBlue)
-            }
-        }
-        if !context.coordinator.hasFramed && !map.annotations.isEmpty {
-            context.coordinator.hasFramed = true
-            map.showAnnotations(map.annotations, animated: false)
-        }
-        if let request = recenterRequest, context.coordinator.lastRecenterID != request.id {
-            context.coordinator.lastRecenterID = request.id
+        if let request = recenterRequest, coordinator.lastRecenterID != request.id {
+            coordinator.lastRecenterID = request.id
             map.setRegion(MKCoordinateRegion(center: request.location.coreLocation.coordinate,
                 span: MKCoordinateSpan(latitudeDelta: 0.12, longitudeDelta: 0.12)), animated: true)
         }
@@ -789,19 +837,41 @@ private struct ChargerMapView: UIViewRepresentable {
         }
     }
 
-    private final class ChargerAnnotation: NSObject, MKAnnotation {
+    struct MarkerState: Equatable {
+        let coordinate: Coordinate
+        let title: String
+        let isProposed: Bool
+        let isAvailable: Bool
+
+        init(station: ChargingStation, at date: Date) {
+            coordinate = station.coordinate
+            title = station.networkName
+            isProposed = station.lifecycle == .proposed
+            isAvailable = station.availability.isReportedAvailable(at: date)
+        }
+
+        func requiresReplacement(comparedWith other: Self) -> Bool {
+            coordinate != other.coordinate || title != other.title || isProposed != other.isProposed
+        }
+    }
+
+    final class ChargerAnnotation: NSObject, MKAnnotation {
         let stationID: String
         let title: String?
         let coordinate: CLLocationCoordinate2D
         var isAvailable: Bool
         let isProposed: Bool
 
-        init(station: ChargingStation, isAvailable: Bool) {
-            stationID = station.id
-            title = station.networkName
-            coordinate = station.coordinate.coreLocation.coordinate
-            self.isAvailable = isAvailable
-            isProposed = station.lifecycle == .proposed
+        var markerTintColor: UIColor {
+            isProposed ? .systemGray : isAvailable ? UIColor(Color.voltMint) : UIColor(Color.voltBlue)
+        }
+
+        init(stationID: String, state: MarkerState) {
+            self.stationID = stationID
+            title = state.title
+            coordinate = CLLocationCoordinate2D(latitude: state.coordinate.latitude, longitude: state.coordinate.longitude)
+            isAvailable = state.isAvailable
+            isProposed = state.isProposed
         }
     }
 
@@ -809,8 +879,93 @@ private struct ChargerMapView: UIViewRepresentable {
         var parent: ChargerMapView
         var hasFramed = false
         var lastRecenterID: UUID?
+        var annotationsByID: [String: ChargerAnnotation] = [:]
+        private var previousMarkerStates: [String: MarkerState] = [:]
+        private var lastResultsRevision: UUID?
+        private var lastMarkerSnapshotTime: Date?
+        private var nextAvailabilityActivation: Date?
+        private var nextAvailabilityExpiry: Date?
 
         init(_ parent: ChargerMapView) { self.parent = parent }
+
+        func updateAnnotationsIfNeeded(
+            on map: MKMapView,
+            stations: [ChargingStation],
+            resultsRevision: UUID,
+            freshnessTime: Date
+        ) {
+            let needsSnapshot = lastResultsRevision != resultsRevision
+                || (lastMarkerSnapshotTime.map { freshnessTime < $0 } ?? true)
+                || (nextAvailabilityActivation.map { freshnessTime >= $0 } ?? false)
+                || (nextAvailabilityExpiry.map { freshnessTime > $0 } ?? false)
+            guard needsSnapshot else { return }
+
+            var markerStates: [String: MarkerState] = [:]
+            markerStates.reserveCapacity(stations.count)
+            var nextActivation: Date?
+            var nextExpiry: Date?
+            for station in stations where markerStates[station.id] == nil {
+                markerStates[station.id] = MarkerState(station: station, at: freshnessTime)
+                let availability = station.availability
+                guard availability.state == .available,
+                      (availability.availableConnectors ?? 0) > 0,
+                      let updatedAt = availability.lastUpdated else { continue }
+                if freshnessTime < updatedAt {
+                    nextActivation = min(nextActivation ?? updatedAt, updatedAt)
+                } else {
+                    // Availability.isStale becomes true only after the 300-second mark.
+                    let expiry = updatedAt.addingTimeInterval(300)
+                    if freshnessTime <= expiry {
+                        nextExpiry = min(nextExpiry ?? expiry, expiry)
+                    }
+                }
+            }
+
+            lastResultsRevision = resultsRevision
+            lastMarkerSnapshotTime = freshnessTime
+            nextAvailabilityActivation = nextActivation
+            nextAvailabilityExpiry = nextExpiry
+            reconcileAnnotations(on: map, stations: stations, markerStates: markerStates)
+        }
+
+        func reconcileAnnotations(on map: MKMapView, stations: [ChargingStation], markerStates: [String: MarkerState]) {
+            guard markerStates != previousMarkerStates else { return }
+
+            let removedIDs = annotationsByID.keys.filter { id in
+                guard let previous = previousMarkerStates[id], let incoming = markerStates[id] else { return true }
+                return incoming.requiresReplacement(comparedWith: previous)
+            }
+            let removedIDSet = Set(removedIDs)
+            let selectedReplacementID = map.selectedAnnotations.compactMap { ($0 as? ChargerAnnotation)?.stationID }
+                .first { removedIDSet.contains($0) && markerStates[$0] != nil }
+            let removals = removedIDs.compactMap { annotationsByID.removeValue(forKey: $0) }
+            if !removals.isEmpty { map.removeAnnotations(removals) }
+
+            if markerStates.count > annotationsByID.count {
+                var seen = Set<String>()
+                let additions = stations.compactMap { station -> ChargerAnnotation? in
+                    guard seen.insert(station.id).inserted,
+                          annotationsByID[station.id] == nil,
+                          let state = markerStates[station.id] else { return nil }
+                    let annotation = ChargerAnnotation(stationID: station.id, state: state)
+                    annotationsByID[station.id] = annotation
+                    return annotation
+                }
+                map.addAnnotations(additions)
+            }
+            if let selectedReplacementID, let replacement = annotationsByID[selectedReplacementID] {
+                map.selectAnnotation(replacement, animated: false)
+            }
+
+            for (id, state) in markerStates {
+                guard let annotation = annotationsByID[id], annotation.isAvailable != state.isAvailable else { continue }
+                annotation.isAvailable = state.isAvailable
+                if let view = map.view(for: annotation) as? MKMarkerAnnotationView {
+                    view.markerTintColor = annotation.markerTintColor
+                }
+            }
+            previousMarkerStates = markerStates
+        }
 
         func mapView(_ mapView: MKMapView, viewFor annotation: any MKAnnotation) -> MKAnnotationView? {
             if let cluster = annotation as? MKClusterAnnotation {
@@ -822,7 +977,7 @@ private struct ChargerMapView: UIViewRepresentable {
             guard let charger = annotation as? ChargerAnnotation else { return nil }
             let view = mapView.dequeueReusableAnnotationView(withIdentifier: "charger", for: charger) as! MKMarkerAnnotationView
             view.clusteringIdentifier = "chargers"
-            view.markerTintColor = charger.isProposed ? .systemGray : charger.isAvailable ? UIColor(Color.voltMint) : UIColor(Color.voltBlue)
+            view.markerTintColor = charger.markerTintColor
             view.glyphImage = UIImage(systemName: charger.isProposed ? "clock" : "bolt.car.fill")
             return view
         }
@@ -1740,6 +1895,22 @@ struct FavoritesView: View {
                     DemoNotice()
                         .padding(.bottom, 18)
                 }
+                if let error = store.errorMessage {
+                    MessageBanner(message: error, isError: true, dismiss: store.clearMessages)
+                        .padding(.bottom, 12)
+                }
+                if let notice = store.noticeMessage {
+                    MessageBanner(message: notice, isError: false, dismiss: store.clearMessages)
+                        .padding(.bottom, 12)
+                }
+                if store.accountDataNeedsRetry {
+                    Button("Retry account sync", systemImage: "arrow.clockwise") {
+                        Task { await store.retryAccountData() }
+                    }
+                    .buttonStyle(.glass)
+                    .disabled(store.isLoadingAccountData)
+                    .padding(.bottom, 18)
+                }
                 if savedStations.isEmpty && !store.favorites.isEmpty && store.stations.isEmpty && store.isLoadingStations {
                     ProgressView("Loading saved chargers…")
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1807,7 +1978,7 @@ struct ProfileView: View {
                     }
                     .disabled(store.isLoadingAccountData)
                 } footer: {
-                    Text("Your sign-in succeeded, but vehicles and saved chargers could not be loaded.")
+                    Text("Vehicles or saved chargers may be out of sync. Retry to confirm the latest account data.")
                 }
             }
             if let notice = store.noticeMessage {

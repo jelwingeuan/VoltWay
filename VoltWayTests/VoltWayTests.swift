@@ -76,6 +76,28 @@ struct VoltWayTests {
             showAll: true, includeProposed: true).isEmpty)
     }
 
+    @Test("Proposed sites remain outside Compatible even when the All sites option was enabled")
+    func proposedSiteCannotLeakIntoCompatible() async {
+        var planned = station(id: "mevnet:planned", connector: .ccs2, power: 150, state: .unknown)
+        planned.lifecycle = .proposed
+        let profile = VehicleProfile(connectors: [.ccs2], minimumPowerKW: nil)
+        #expect(profile.accepts(planned))
+
+        let compatibleFilter = DiscoveryFilter(
+            query: "", availableNowOnly: false, network: nil, profile: profile,
+            showAll: false, chargingType: nil, minimumListedPowerKW: nil,
+            access: nil, includeProposed: true
+        )
+        let compatible = await StationDiscovery.resultsOffMain(
+            from: [planned], filter: compatibleFilter, networkChoices: nil, now: now
+        )
+        #expect(compatible.stations.isEmpty)
+        #expect(StationDiscovery.visibleStations(
+            from: [planned], query: "", availableNowOnly: false,
+            profile: profile, showAll: true, includeProposed: true
+        ).map(\.id) == ["mevnet:planned"])
+    }
+
     @Test("Catalog response keeps MEVnet accounting separate from OCM and tolerates older station snapshots")
     func mevnetCoverageDecoding() throws {
         let payload = #"{"stations":[],"mevnetSyncedAt":"2026-09-28T00:00:00Z","mevnetImportReport":{"fetched":3,"included":2,"existing":1,"proposed":1,"unknown":0,"invalid":1,"private":0,"states":{"PERAK":{"fetched":3,"included":2,"proposed":1,"invalid":1,"private":0}}}}"#
@@ -628,6 +650,12 @@ struct CarPlayPresentationTests {
 struct BackendClientTests {
     private let configuration = AppConfiguration(supabaseURL: URL(string: "https://voltway.test"), supabaseAnonKey: "public-anon-key")
 
+    enum FavoriteDeleteScenario: CaseIterable, Sendable {
+        case secondDeleteNotCommitted
+        case responseLostAfterCommit
+        case reconciliationUnavailable
+    }
+
     @Test("A successful login can retry an account-data load failure", arguments: ["/auth/v1/token", "/auth/v1/signup"])
     @MainActor func accountLoadFailureCanRetry(authPath: String) async throws {
         let profileRequests = LockedCounter()
@@ -1130,6 +1158,100 @@ struct BackendClientTests {
         #expect(store.favoriteStationIDs.contains("gentari-site") == false)
         #expect(deletedOCM.value == 1)
         #expect(deletedMEVnet.value == 1)
+        await store.signOut()
+    }
+
+    @Test("A failed alias deletion reconciles with server state", .serialized, arguments: FavoriteDeleteScenario.allCases)
+    @MainActor func partialFavoriteAliasDeletion(scenario: FavoriteDeleteScenario) async throws {
+        func station(_ id: String, source: StationSource) -> ChargingStation {
+            ChargingStation(
+                id: id, name: "Shared charging site", address: "Kuala Lumpur",
+                coordinate: Coordinate(latitude: 3.14, longitude: 101.68), operatorName: "Gentari",
+                connectors: [Connector(kind: .ccs2, powerKW: 120, count: 2)],
+                availability: Availability(state: .unknown, availableConnectors: nil, totalConnectors: nil, lastUpdated: nil),
+                price: nil, source: source
+            )
+        }
+
+        var current = station("gentari-site", source: .gentari)
+        current.sourceIDs = ["gentari": "gentari-site", "openChargeMap": "ocm:42", "mevnet": "7"]
+        let oldMEVnet = station("mevnet:7", source: .mevnet)
+        let oldOCM = station("ocm:42", source: .openChargeMap)
+        let favorites = [oldMEVnet, oldOCM].map {
+            FavoriteStation(userID: "user-1", stationID: $0.id, stationSnapshot: $0, createdAt: nil)
+        }
+        let profile = VehicleProfile(userID: "user-1", name: "Daily EV", connectors: [.ccs2], minimumPowerKW: nil)
+        let encoder = JSONEncoder()
+        let favoriteResponse = try encoder.encode(favorites)
+        let remainingFavoriteResponse = try encoder.encode([favorites[1]])
+        let profileResponse = try encoder.encode([profile])
+        let stationResponse = Data(#"{"stations":"#.utf8) + (try encoder.encode([current])) + Data("}".utf8)
+        let deleteRequests = LockedCounter()
+        let firstDeletedURL = LockedURL()
+        MockURLProtocol.handler = { request in
+            switch (request.url?.path, request.httpMethod) {
+            case ("/auth/v1/token", _):
+                return (200, Data(#"{"access_token":"fresh","refresh_token":"refresh-1","user":{"id":"user-1","email":"driver@example.com"}}"#.utf8))
+            case ("/rest/v1/vehicle_profiles", "GET"):
+                return (200, profileResponse)
+            case ("/rest/v1/favorite_stations", "GET"):
+                guard deleteRequests.value >= 2 else { return (200, favoriteResponse) }
+                switch scenario {
+                case .secondDeleteNotCommitted: return (200, remainingFavoriteResponse)
+                case .responseLostAfterCommit: return (200, Data("[]".utf8))
+                case .reconciliationUnavailable: return (503, Data(#"{"message":"Read failed"}"#.utf8))
+                }
+            case ("/functions/v1/stations", _):
+                return (200, stationResponse)
+            case ("/rest/v1/favorite_stations", "DELETE"):
+                deleteRequests.increment()
+                if deleteRequests.value == 1 {
+                    firstDeletedURL.set(request.url)
+                    return (204, Data())
+                }
+                return deleteRequests.value == 2
+                    ? (503, Data(#"{"message":"Delete failed"}"#.utf8))
+                    : (204, Data())
+            default:
+                return (200, Data("[]".utf8))
+            }
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let store = VoltWayStore(configuration: configuration, backend: makeClient(account: "test-\(UUID().uuidString)"))
+        await store.signIn(email: "driver@example.com", password: "password-123")
+        #expect(store.favorites.count == 2)
+
+        await store.toggleFavorite(current)
+        let firstDeleted = try #require(firstDeletedURL.value)
+        let deletedQuery = try #require(URLComponents(url: firstDeleted, resolvingAgainstBaseURL: false)?
+            .queryItems?.first(where: { $0.name == "station_id" })?.value)
+        let deletedID = String(deletedQuery.dropFirst(3))
+        #expect(deletedID == "mevnet:7")
+        #expect(deleteRequests.value == 2)
+        switch scenario {
+        case .secondDeleteNotCommitted:
+            #expect(store.favorites.map(\.stationID) == ["ocm:42"])
+            #expect(store.favoriteStationIDs.contains("mevnet:7") == false)
+            #expect(store.favoriteStationIDs.contains(current.id))
+            #expect(CarPlaySnapshotStore.load().favoriteStationIDs == [current.id])
+            await store.toggleFavorite(current)
+            #expect(deleteRequests.value == 3)
+            #expect(store.favorites.isEmpty)
+            #expect(CarPlaySnapshotStore.load().favoriteStationIDs.isEmpty)
+        case .responseLostAfterCommit:
+            #expect(store.favorites.isEmpty)
+            #expect(store.favoriteStationIDs.isEmpty)
+            #expect(CarPlaySnapshotStore.load().favoriteStationIDs.isEmpty)
+            #expect(store.errorMessage == nil)
+            #expect(store.noticeMessage == "Saved charger removed; confirmation was interrupted.")
+        case .reconciliationUnavailable:
+            #expect(store.favorites.map(\.stationID) == ["mevnet:7", "ocm:42"])
+            #expect(store.favoriteStationIDs.contains(current.id))
+            #expect(CarPlaySnapshotStore.load().favoriteStationIDs == [current.id])
+            #expect(store.accountDataNeedsRetry)
+            #expect(store.errorMessage == "Saved chargers could not be verified. Reload account data to check them.")
+        }
         await store.signOut()
     }
 

@@ -166,7 +166,7 @@ enum StationAccess: String, Codable, Equatable, Hashable, Sendable {
     }
 }
 
-enum ChargingType: String, CaseIterable, Identifiable {
+enum ChargingType: String, CaseIterable, Identifiable, Sendable {
     case ac = "AC"
     case dc = "DC"
     var id: Self { self }
@@ -521,7 +521,46 @@ struct FavoriteStation: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
+struct DiscoveryFilter: Sendable {
+    let query: String
+    let availableNowOnly: Bool
+    let network: String?
+    let profile: VehicleProfile
+    let showAll: Bool
+    let chargingType: ChargingType?
+    let minimumListedPowerKW: Double?
+    let access: StationAccess?
+    let includeProposed: Bool
+}
+
+struct DiscoveryResults: Sendable {
+    let stations: [ChargingStation]
+    let networks: [String]
+}
+
 enum StationDiscovery {
+    @concurrent static func resultsOffMain(
+        from candidates: [ChargingStation],
+        filter: DiscoveryFilter,
+        networkChoices: [String]?,
+        now: Date
+    ) async -> DiscoveryResults {
+        let stations = visibleStations(
+            from: candidates,
+            query: filter.query,
+            availableNowOnly: filter.availableNowOnly,
+            network: filter.network,
+            profile: filter.profile,
+            showAll: filter.showAll,
+            chargingType: filter.chargingType,
+            minimumListedPowerKW: filter.minimumListedPowerKW,
+            access: filter.access,
+            includeProposed: filter.includeProposed,
+            now: now
+        )
+        return DiscoveryResults(stations: stations, networks: networkChoices ?? networks(from: candidates))
+    }
+
     static func compatibleStations(
         from stations: [ChargingStation],
         profile: VehicleProfile,
@@ -572,7 +611,7 @@ enum StationDiscovery {
                 station.connectors.contains { type == .ac ? $0.kind == .type2 : $0.kind == .ccs2 || $0.kind == .chademo }
             } ?? true
             let matchesPower = minimumListedPowerKW.map { (station.maximumPowerKW ?? 0) >= $0 } ?? true
-            return (includeProposed || station.lifecycle != .proposed) && matchesSearch && matchesAvailability && matchesVehicle && matchesChargingType && matchesPower &&
+            return ((showAll && includeProposed) || station.lifecycle != .proposed) && matchesSearch && matchesAvailability && matchesVehicle && matchesChargingType && matchesPower &&
                 (network == nil || station.networkName == network) && (access == nil || (station.access ?? .unknown) == access)
         }
     }
