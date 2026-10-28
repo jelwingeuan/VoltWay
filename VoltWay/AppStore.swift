@@ -14,6 +14,7 @@ final class VoltWayStore {
     private(set) var favorites: [FavoriteStation] = []
     private(set) var favoriteStationIDs: Set<String> = []
     private(set) var favoriteStations: [ChargingStation] = []
+    private(set) var favoriteMutationIDs: Set<String> = []
     private(set) var currentLocation: Coordinate?
     private(set) var lastSuccessfulStationFetchAt: Date?
     private(set) var catalogSyncedAt: Date?
@@ -115,6 +116,7 @@ final class VoltWayStore {
             let signedIn = try await backend.signIn(email: email, password: password)
             guard accountRevision == revision else { return }
             accountRevision += 1
+            favoriteMutationIDs = []
             session = signedIn
             await retryAccountData()
         } catch {
@@ -137,6 +139,7 @@ final class VoltWayStore {
             guard accountRevision == revision else { return }
             if let signedUp {
                 accountRevision += 1
+                favoriteMutationIDs = []
                 session = signedUp
                 await retryAccountData()
             } else {
@@ -179,6 +182,7 @@ final class VoltWayStore {
         isLoadingAccountData = false
         accountDataNeedsRetry = false
         favorites = []
+        favoriteMutationIDs = []
         rebuildFavorites()
         currentLocation = nil
         cachedCompatibleStations = []
@@ -412,8 +416,14 @@ final class VoltWayStore {
     }
 
     func toggleFavorite(_ station: ChargingStation) async {
+        guard favoriteMutationIDs.insert(station.id).inserted else { return }
         let accountRevision = accountRevision
         let userID = session?.userID
+        defer {
+            if isCurrentAccount(accountRevision, userID: userID) {
+                favoriteMutationIDs.remove(station.id)
+            }
+        }
         let previous = favorites
         let savedIDs = Set(previous.map(\.stationID))
         let matchingIDs = favoriteSourceIDsByStationID[station.id, default: []]
@@ -443,12 +453,15 @@ final class VoltWayStore {
                 do {
                     let confirmedFavorites = try await backend.loadFavorites(session: session)
                     guard isCurrentAccount(accountRevision, userID: userID) else { return }
-                    favorites = confirmedFavorites
+                    // Reconcile only this station; another charger can be saved concurrently.
+                    favorites = favorites.filter { !matchingIDs.contains($0.stationID) }
+                        + confirmedFavorites.filter { matchingIDs.contains($0.stationID) }
                 } catch {
                     guard isCurrentAccount(accountRevision, userID: userID) else { return }
                     // The DELETE may have committed despite its failed response; keep the prior
                     // saved state until a fresh read can establish what actually remains.
-                    favorites = previous
+                    favorites = favorites.filter { !matchingIDs.contains($0.stationID) }
+                        + previous.filter { matchingIDs.contains($0.stationID) }
                     rebuildFavorites()
                     persistCarPlaySnapshot()
                     accountDataNeedsRetry = true
@@ -456,7 +469,8 @@ final class VoltWayStore {
                     return
                 }
             } else {
-                favorites = previous
+                // A different charger's save may have completed while this request was in flight.
+                favorites.removeAll { $0.stationID == station.id }
             }
             rebuildFavorites()
             persistCarPlaySnapshot()

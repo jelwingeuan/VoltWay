@@ -699,6 +699,31 @@ struct BackendClientTests {
         case reconciliationUnavailable
     }
 
+    private func favoriteStation(id: String = "gentari-favorite") -> ChargingStation {
+        ChargingStation(
+            id: id, name: "Favorite charger", address: "Kuala Lumpur",
+            coordinate: Coordinate(latitude: 3.14, longitude: 101.68), operatorName: "Gentari",
+            connectors: [Connector(kind: .ccs2, powerKW: 120, count: 2)],
+            availability: Availability(state: .unknown, availableConnectors: nil, totalConnectors: nil, lastUpdated: nil),
+            price: nil, source: .gentari
+        )
+    }
+
+    private func waitForRequest(_ counter: LockedCounter, count: Int = 1) async throws {
+        for _ in 0..<500 where counter.value < count {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try #require(counter.value >= count, "Expected mocked request did not start")
+    }
+
+    @Test("Mocked JSON request bodies can arrive as a stream")
+    func streamedRequestBody() {
+        let payload = Data(#"{"station_id":"private:site-1"}"#.utf8)
+        var request = URLRequest(url: URL(string: "https://voltway.test/rest/v1/favorite_stations")!)
+        request.httpBodyStream = InputStream(data: payload)
+        #expect(MockURLProtocol.bodyData(for: request) == payload)
+    }
+
     @Test("A successful login can retry an account-data load failure", arguments: ["/auth/v1/token", "/auth/v1/signup"])
     @MainActor func accountLoadFailureCanRetry(authPath: String) async throws {
         let profileRequests = LockedCounter()
@@ -1365,6 +1390,269 @@ struct BackendClientTests {
         await store.signOut()
     }
 
+    @Test("Rapid save taps keep one favorite request in flight")
+    @MainActor func favoriteSaveIsSingleFlight() async throws {
+        let station = favoriteStation()
+        let posts = LockedCounter()
+        let deletes = LockedCounter()
+        let releaseSave = DispatchSemaphore(value: 0)
+        MockURLProtocol.handler = { request in
+            switch (request.url?.path, request.httpMethod) {
+            case ("/auth/v1/token", _):
+                return (200, Data(#"{"access_token":"fresh","refresh_token":"refresh-1","user":{"id":"user-1","email":"driver@example.com"}}"#.utf8))
+            case ("/rest/v1/favorite_stations", "POST"):
+                posts.increment()
+                if posts.value == 1 { _ = releaseSave.wait(timeout: .now() + 10) }
+                return (204, Data())
+            case ("/rest/v1/favorite_stations", "DELETE"):
+                deletes.increment()
+                return (204, Data())
+            case ("/functions/v1/stations", _):
+                return (200, Data(#"{"stations":[]}"#.utf8))
+            default:
+                return (200, Data("[]".utf8))
+            }
+        }
+        defer {
+            releaseSave.signal()
+            MockURLProtocol.handler = nil
+        }
+
+        let store = VoltWayStore(configuration: configuration, backend: makeClient(account: "test-\(UUID().uuidString)"))
+        await store.signIn(email: "driver@example.com", password: "password-123")
+        let firstTap = Task { await store.toggleFavorite(station) }
+        try await waitForRequest(posts)
+        #expect(store.favoriteMutationIDs.contains(station.id))
+        let secondTap = Task { await store.toggleFavorite(station) }
+        await secondTap.value
+        #expect(posts.value == 1)
+        #expect(deletes.value == 0)
+        releaseSave.signal()
+        await firstTap.value
+        #expect(store.favoriteMutationIDs.isEmpty)
+        #expect(store.favoriteStationIDs.contains(station.id))
+        await store.signOut()
+    }
+
+    @Test("Rapid remove taps keep one favorite deletion in flight")
+    @MainActor func favoriteDeleteIsSingleFlight() async throws {
+        let station = favoriteStation()
+        let saved = FavoriteStation(userID: "user-1", stationID: station.id, stationSnapshot: station, createdAt: nil)
+        let savedResponse = try JSONEncoder().encode([saved])
+        let posts = LockedCounter()
+        let deletes = LockedCounter()
+        let releaseDelete = DispatchSemaphore(value: 0)
+        MockURLProtocol.handler = { request in
+            switch (request.url?.path, request.httpMethod) {
+            case ("/auth/v1/token", _):
+                return (200, Data(#"{"access_token":"fresh","refresh_token":"refresh-1","user":{"id":"user-1","email":"driver@example.com"}}"#.utf8))
+            case ("/rest/v1/favorite_stations", "GET"):
+                return (200, savedResponse)
+            case ("/rest/v1/favorite_stations", "POST"):
+                posts.increment()
+                return (204, Data())
+            case ("/rest/v1/favorite_stations", "DELETE"):
+                deletes.increment()
+                if deletes.value == 1 { _ = releaseDelete.wait(timeout: .now() + 10) }
+                return (204, Data())
+            case ("/functions/v1/stations", _):
+                return (200, Data(#"{"stations":[]}"#.utf8))
+            default:
+                return (200, Data("[]".utf8))
+            }
+        }
+        defer {
+            releaseDelete.signal()
+            MockURLProtocol.handler = nil
+        }
+
+        let store = VoltWayStore(configuration: configuration, backend: makeClient(account: "test-\(UUID().uuidString)"))
+        await store.signIn(email: "driver@example.com", password: "password-123")
+        #expect(store.favoriteStationIDs.contains(station.id))
+        let firstTap = Task { await store.toggleFavorite(station) }
+        try await waitForRequest(deletes)
+        #expect(store.favoriteMutationIDs.contains(station.id))
+        let secondTap = Task { await store.toggleFavorite(station) }
+        await secondTap.value
+        #expect(deletes.value == 1)
+        #expect(posts.value == 0)
+        releaseDelete.signal()
+        await firstTap.value
+        #expect(store.favoriteMutationIDs.isEmpty)
+        #expect(store.favoriteStationIDs.contains(station.id) == false)
+        await store.signOut()
+    }
+
+    @Test("A failed save does not discard another charger's concurrent success")
+    @MainActor func favoriteMutationsRemainPerStation() async throws {
+        let first = favoriteStation(id: "gentari-first")
+        let second = favoriteStation(id: "gentari-second")
+        let firstPosts = LockedCounter()
+        let secondPosts = LockedCounter()
+        let releaseFirst = DispatchSemaphore(value: 0)
+        MockURLProtocol.handler = { request in
+            switch (request.url?.path, request.httpMethod) {
+            case ("/auth/v1/token", _):
+                return (200, Data(#"{"access_token":"fresh","refresh_token":"refresh-1","user":{"id":"user-1","email":"driver@example.com"}}"#.utf8))
+            case ("/rest/v1/favorite_stations", "POST"):
+                let body = String(decoding: MockURLProtocol.bodyData(for: request), as: UTF8.self)
+                if body.contains(first.id) {
+                    firstPosts.increment()
+                    _ = releaseFirst.wait(timeout: .now() + 10)
+                    return (503, Data(#"{"message":"Save failed"}"#.utf8))
+                }
+                if body.contains(second.id) {
+                    secondPosts.increment()
+                    return (204, Data())
+                }
+                return (400, Data(#"{"message":"Unknown favorite"}"#.utf8))
+            case ("/functions/v1/stations", _):
+                return (200, Data(#"{"stations":[]}"#.utf8))
+            default:
+                return (200, Data("[]".utf8))
+            }
+        }
+        defer {
+            releaseFirst.signal()
+            MockURLProtocol.handler = nil
+        }
+
+        let store = VoltWayStore(configuration: configuration, backend: makeClient(account: "test-\(UUID().uuidString)"))
+        await store.signIn(email: "driver@example.com", password: "password-123")
+        let firstTap = Task { await store.toggleFavorite(first) }
+        try await waitForRequest(firstPosts)
+        #expect(store.favoriteMutationIDs == [first.id])
+        let secondTap = Task { await store.toggleFavorite(second) }
+        try await waitForRequest(secondPosts)
+        await secondTap.value
+        #expect(store.favoriteMutationIDs == [first.id])
+        #expect(store.favoriteStationIDs.contains(second.id))
+        releaseFirst.signal()
+        await firstTap.value
+        #expect(store.favoriteMutationIDs.isEmpty)
+        #expect(store.favoriteStationIDs.contains(first.id) == false)
+        #expect(store.favoriteStationIDs.contains(second.id))
+        #expect(store.errorMessage == "Save failed")
+        await store.signOut()
+    }
+
+    @Test("Failed favorite removal reconciles its site without discarding another pending save")
+    @MainActor func failedFavoriteRemovalPreservesOtherMutation() async throws {
+        let removing = favoriteStation(id: "gentari-removing")
+        let saving = favoriteStation(id: "gentari-saving")
+        let saved = FavoriteStation(userID: "user-1", stationID: removing.id, stationSnapshot: removing, createdAt: nil)
+        let savedResponse = try JSONEncoder().encode([saved])
+        let deletes = LockedCounter()
+        let posts = LockedCounter()
+        let releaseDelete = DispatchSemaphore(value: 0)
+        let releaseSave = DispatchSemaphore(value: 0)
+        MockURLProtocol.handler = { request in
+            switch (request.url?.path, request.httpMethod) {
+            case ("/auth/v1/token", _):
+                return (200, Data(#"{"access_token":"fresh","refresh_token":"refresh-1","user":{"id":"user-1","email":"driver@example.com"}}"#.utf8))
+            case ("/rest/v1/favorite_stations", "GET"):
+                return (200, savedResponse)
+            case ("/rest/v1/favorite_stations", "DELETE"):
+                deletes.increment()
+                _ = releaseDelete.wait(timeout: .now() + 10)
+                return (503, Data(#"{"message":"Delete failed"}"#.utf8))
+            case ("/rest/v1/favorite_stations", "POST"):
+                posts.increment()
+                _ = releaseSave.wait(timeout: .now() + 10)
+                return (204, Data())
+            case ("/functions/v1/stations", _):
+                return (200, Data(#"{"stations":[]}"#.utf8))
+            default:
+                return (200, Data("[]".utf8))
+            }
+        }
+        defer {
+            releaseDelete.signal()
+            releaseSave.signal()
+            MockURLProtocol.handler = nil
+        }
+
+        let store = VoltWayStore(configuration: configuration, backend: makeClient(account: "test-\(UUID().uuidString)"))
+        await store.signIn(email: "driver@example.com", password: "password-123")
+        let removeTap = Task { await store.toggleFavorite(removing) }
+        try await waitForRequest(deletes)
+        let saveTap = Task { await store.toggleFavorite(saving) }
+        try await waitForRequest(posts)
+        #expect(store.favoriteMutationIDs == [removing.id, saving.id])
+
+        releaseDelete.signal()
+        await removeTap.value
+        #expect(store.favoriteMutationIDs == [saving.id])
+        #expect(store.favoriteStationIDs.contains(removing.id))
+        #expect(store.favoriteStationIDs.contains(saving.id))
+        #expect(store.errorMessage == "Delete failed")
+
+        releaseSave.signal()
+        await saveTap.value
+        #expect(store.favoriteMutationIDs.isEmpty)
+        #expect(store.favoriteStationIDs.contains(removing.id))
+        #expect(store.favoriteStationIDs.contains(saving.id))
+        await store.signOut()
+    }
+
+    @Test("An old account's favorite completion cannot clear a new account's busy marker")
+    @MainActor func favoriteBusyStateSurvivesAccountSwitch() async throws {
+        let station = favoriteStation()
+        let oldPosts = LockedCounter()
+        let newPosts = LockedCounter()
+        let authRequests = LockedCounter()
+        let releaseOld = DispatchSemaphore(value: 0)
+        let releaseNew = DispatchSemaphore(value: 0)
+        MockURLProtocol.handler = { request in
+            switch (request.url?.path, request.httpMethod) {
+            case ("/auth/v1/token", _):
+                authRequests.increment()
+                let user = authRequests.value == 1 ? "user-1" : "user-2"
+                let token = authRequests.value == 1 ? "old-token" : "new-token"
+                return (200, Data(#"{"access_token":"\#(token)","refresh_token":"refresh","user":{"id":"\#(user)","email":"driver@example.com"}}"#.utf8))
+            case ("/rest/v1/favorite_stations", "POST"):
+                if request.value(forHTTPHeaderField: "Authorization") == "Bearer old-token" {
+                    oldPosts.increment()
+                    _ = releaseOld.wait(timeout: .now() + 10)
+                } else {
+                    newPosts.increment()
+                    _ = releaseNew.wait(timeout: .now() + 10)
+                }
+                return (204, Data())
+            case ("/functions/v1/stations", _):
+                return (200, Data(#"{"stations":[]}"#.utf8))
+            default:
+                return (200, Data("[]".utf8))
+            }
+        }
+        defer {
+            releaseOld.signal()
+            releaseNew.signal()
+            MockURLProtocol.handler = nil
+        }
+
+        let store = VoltWayStore(configuration: configuration, backend: makeClient(account: "test-\(UUID().uuidString)"))
+        await store.signIn(email: "old@example.com", password: "password-123")
+        let oldTap = Task { await store.toggleFavorite(station) }
+        try await waitForRequest(oldPosts)
+        #expect(store.favoriteMutationIDs.contains(station.id))
+        await store.signOut()
+        #expect(store.favoriteMutationIDs.isEmpty)
+
+        await store.signIn(email: "new@example.com", password: "password-123")
+        let newTap = Task { await store.toggleFavorite(station) }
+        try await waitForRequest(newPosts)
+        #expect(store.favoriteMutationIDs.contains(station.id))
+        releaseOld.signal()
+        await oldTap.value
+        #expect(store.favoriteMutationIDs.contains(station.id))
+        releaseNew.signal()
+        await newTap.value
+        #expect(store.favoriteMutationIDs.isEmpty)
+        #expect(store.favorites.first?.userID == "user-2")
+        await store.signOut()
+    }
+
     @Test("Private charger creation requires authenticated owner-consent RPC")
     func privateSiteCreationRPC() async throws {
         let station = ChargingStation(
@@ -1383,7 +1671,7 @@ struct BackendClientTests {
             #expect(request.url?.path == "/rest/v1/rpc/create_private_charger_site")
             #expect(request.httpMethod == "POST")
             #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer caller-token")
-            let body = try? JSONSerialization.jsonObject(with: request.httpBody ?? Data()) as? [String: Any]
+            let body = try? JSONSerialization.jsonObject(with: MockURLProtocol.bodyData(for: request)) as? [String: Any]
             #expect(body?["p_id"] as? String == id.uuidString)
             #expect(body?["p_owner_consent"] as? Bool == true)
             #expect(body?["p_invited_email"] as? String == "guest@example.com")
@@ -1418,7 +1706,7 @@ struct BackendClientTests {
             }
             #expect(request.url?.path == "/rest/v1/favorite_stations")
             #expect(request.httpMethod == "POST")
-            let body = try? JSONSerialization.jsonObject(with: request.httpBody ?? Data()) as? [String: Any]
+            let body = try? JSONSerialization.jsonObject(with: MockURLProtocol.bodyData(for: request)) as? [String: Any]
             #expect(body?["station_id"] as? String == privateStation.id)
             #expect(body?["station_snapshot"] is NSNull)
             postCount.increment()
@@ -1589,6 +1877,23 @@ private final class InMemoryCredentialStore: SessionCredentialStore {
 
 private final class MockURLProtocol: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) static var handler: (@Sendable (URLRequest) -> (Int, Data))?
+
+    static func bodyData(for request: URLRequest) -> Data {
+        if let body = request.httpBody { return body }
+        guard let stream = request.httpBodyStream else { return Data() }
+        stream.open()
+        defer { stream.close() }
+        var body = Data()
+        var buffer = [UInt8](repeating: 0, count: 4_096)
+        while true {
+            let count = buffer.withUnsafeMutableBufferPointer { bytes in
+                stream.read(bytes.baseAddress!, maxLength: bytes.count)
+            }
+            guard count > 0 else { break }
+            body.append(contentsOf: buffer.prefix(count))
+        }
+        return body
+    }
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }

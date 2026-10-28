@@ -1219,6 +1219,7 @@ struct StationDetailView: View {
     @Namespace private var alternativeTransition
 
     private var isFavorite: Bool { store.favoriteStationIDs.contains(station.id) }
+    private var isFavoriteMutationInFlight: Bool { store.favoriteMutationIDs.contains(station.id) }
 
     var body: some View {
         ScrollView {
@@ -1253,7 +1254,11 @@ struct StationDetailView: View {
                 } label: {
                     Image(systemName: isFavorite ? "heart.fill" : "heart")
                 }
-                .accessibilityLabel(isFavorite ? "Remove from favorites" : "Add to favorites")
+                .disabled(isFavoriteMutationInFlight)
+                .accessibilityLabel(isFavoriteMutationInFlight
+                    ? (isFavorite ? "Saving favorite" : "Removing favorite")
+                    : (isFavorite ? "Remove from favorites" : "Add to favorites"))
+                .accessibilityValue(isFavoriteMutationInFlight ? "In progress" : (isFavorite ? "Saved" : "Not saved"))
             }
         }
         .onAppear { freshnessTime = .now }

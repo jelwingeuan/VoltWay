@@ -7,6 +7,33 @@ on:
     branches: [ "main" ]
 
 jobs:
+  database:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      SUPABASE_TELEMETRY_DISABLED: '1'
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: supabase/setup-cli@v1
+      with:
+        version: 2.122.0
+    - name: Start disposable database
+      run: supabase db start
+    - name: Verify legacy private-favorite backfill
+      run: |
+        supabase db reset --local --version 202609280004 --sql-paths fixtures/legacy_private_favorite.sql --yes
+        supabase db query --local --file supabase/fixtures/assert_legacy_private_favorite_before.sql
+        supabase migration up --local --yes
+        supabase db query --local --file supabase/fixtures/assert_legacy_private_favorite_after.sql
+    - name: Test favorite RLS and snapshot constraints
+      run: |
+        set -o pipefail
+        supabase test db supabase/tests/private_favorite_storage.sql --local 2>&1 | tee "$RUNNER_TEMP/voltway-pgtap.txt"
+        grep -Eq 'Files=1,[[:space:]]*Tests=10' "$RUNNER_TEMP/voltway-pgtap.txt"
+
   test:
     runs-on: xcode-27
 
