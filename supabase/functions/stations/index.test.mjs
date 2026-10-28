@@ -54,6 +54,61 @@ test("Authenticated search serves cached open data when Gentari is unavailable",
   }
 });
 
+test("A malformed or entirely unrecognizable Gentari feed warns and uses the catalog", async () => {
+  const originalFetch = globalThis.fetch;
+  environment.GENTARI_API_URL = "https://gentari.test/stations";
+  environment.GENTARI_API_TOKEN = "partner-token";
+  try {
+    for (const payload of [{ error: "feed changed" }, [
+      { id: "site-1", name: "Site without coordinates or connectors" },
+    ]]) {
+      globalThis.fetch = async (url) => {
+        if (String(url).includes("/auth/v1/user")) return Response.json({ id: "user-1" });
+        if (String(url).includes("gentari.test")) return Response.json(payload);
+        if (String(url).includes("/private_charger_sites")) return Response.json([]);
+        return Response.json([{ stations: [{
+          id: "ocm:42", name: "Catalog site", address: "Kuala Lumpur", operatorName: "Operator",
+          coordinate: { latitude: 3.14, longitude: 101.68 }, connectors: [],
+          availability: { state: "unknown", availableConnectors: null, totalConnectors: null, lastUpdated: null },
+          price: null, source: "openChargeMap",
+        }], synced_at: new Date().toISOString() }]);
+      };
+      const response = await handler(request());
+      const data = await response.json();
+      assert.equal(response.status, 200);
+      assert.deepEqual(data.stations.map((station) => station.id), ["ocm:42"]);
+      assert.ok(data.warnings.some((warning) => warning.includes("Gentari live feed unavailable")));
+    }
+  } finally {
+    delete environment.GENTARI_API_URL;
+    delete environment.GENTARI_API_TOKEN;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("An explicitly empty Gentari station list is valid source data", async () => {
+  const originalFetch = globalThis.fetch;
+  environment.GENTARI_API_URL = "https://gentari.test/stations";
+  environment.GENTARI_API_TOKEN = "partner-token";
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("/auth/v1/user")) return Response.json({ id: "user-1" });
+    if (String(url).includes("gentari.test")) return Response.json({ stations: [] });
+    if (String(url).includes("/private_charger_sites")) return Response.json([]);
+    return new Response("Unavailable", { status: 503 });
+  };
+  try {
+    const response = await handler(request());
+    const data = await response.json();
+    assert.equal(response.status, 200);
+    assert.deepEqual(data.stations, []);
+    assert.ok(data.warnings.every((warning) => !warning.includes("Gentari live feed unavailable")));
+  } finally {
+    delete environment.GENTARI_API_URL;
+    delete environment.GENTARI_API_TOKEN;
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("Private station reads use the signed-in JWT so database RLS can filter invitees", async () => {
   const originalFetch = globalThis.fetch;
   let privateRequest;

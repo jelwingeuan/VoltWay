@@ -736,13 +736,23 @@ struct DiscoverView: View {
 
     @ViewBuilder private var emptyResults: some View {
         if !showAllSites && store.profile.connectors.isEmpty {
-            EmptyState(
-                icon: "car.side.lock",
-                title: "Add your EV",
-                detail: "Choose its connectors before searching for compatible chargers.",
-                actionTitle: "Set up vehicle",
-                action: { showingVehicleProfile = true }
-            )
+            if store.vehicles.isEmpty {
+                EmptyState(
+                    icon: "car.side.lock",
+                    title: "Add your EV",
+                    detail: "Choose its connectors before searching for compatible chargers.",
+                    actionTitle: "Set up vehicle",
+                    action: { showingVehicleProfile = true }
+                )
+            } else {
+                EmptyState(
+                    icon: "car.side.lock",
+                    title: "Select a vehicle",
+                    detail: "Choose one of your saved vehicles in Profile to see compatible chargers.",
+                    actionTitle: nil,
+                    action: nil
+                )
+            }
         } else if store.errorMessage != nil && store.stations.isEmpty {
             EmptyState(
                 icon: "wifi.exclamationmark",
@@ -1644,9 +1654,15 @@ struct TripPlannerView: View {
                         .tint(.voltBlue)
                         .disabled(isPlanning || store.isLoadingStations || store.profile.connectors.isEmpty || store.stations.isEmpty)
                         if store.profile.connectors.isEmpty {
-                            Button("Set up vehicle connectors") { showingVehicleProfile = true }
-                                .font(.subheadline.weight(.semibold))
-                                .buttonStyle(.glass)
+                            if store.vehicles.isEmpty {
+                                Button("Set up vehicle connectors") { showingVehicleProfile = true }
+                                    .font(.subheadline.weight(.semibold))
+                                    .buttonStyle(.glass)
+                            } else {
+                                Text("Select one of your vehicles in Profile before checking route stops.")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                     }
                 }
@@ -1684,10 +1700,12 @@ struct TripPlannerView: View {
                 } else if store.profile.connectors.isEmpty {
                     EmptyState(
                         icon: "car.side.lock",
-                        title: "Set up your vehicle",
-                        detail: "Choose its connectors before checking compatible route stops.",
-                        actionTitle: "Set up vehicle",
-                        action: { showingVehicleProfile = true }
+                        title: store.vehicles.isEmpty ? "Set up your vehicle" : "Select a vehicle",
+                        detail: store.vehicles.isEmpty
+                            ? "Choose its connectors before checking compatible route stops."
+                            : "Choose one of your saved vehicles in Profile before checking route stops.",
+                        actionTitle: store.vehicles.isEmpty ? "Set up vehicle" : nil,
+                        action: store.vehicles.isEmpty ? { showingVehicleProfile = true } : nil
                     )
                 } else if store.stations.isEmpty {
                     EmptyState(
@@ -2207,14 +2225,15 @@ struct ProfileView: View {
                         .accessibilityHidden(true)
 
                     VStack(alignment: .leading, spacing: 4) {
-                        Text(activeVehicle?.name ?? "Your charging profile")
+                        Text(activeVehicle?.name ?? (store.vehicles.isEmpty ? "Your charging profile" : "Choose an active vehicle"))
                             .font(.title3.weight(.bold))
-                        Text(activeVehicle?.connectors.map(\.title).joined(separator: " + ") ?? "Add a vehicle to filter compatible sites")
+                        Text(activeVehicle?.connectors.map(\.title).joined(separator: " + ")
+                             ?? (store.vehicles.isEmpty ? "Add a vehicle to filter compatible sites" : "Select a saved vehicle to filter compatible sites"))
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
                     }
                     Spacer(minLength: 4)
-                    if store.vehicles.count > 1 {
+                    if store.vehicles.count > 1 || (activeVehicle == nil && !store.vehicles.isEmpty) {
                         Menu {
                             ForEach(store.vehicles) { vehicle in
                                 Button {
@@ -2380,11 +2399,14 @@ struct VehicleProfileView: View {
     @State private var minimumPower: String
     @State private var isSaving = false
     @State private var validationMessage: String?
+    @State private var pendingVehicleID = UUID()
+    @State private var isCreatingVehicle: Bool
 
     init(store: VoltWayStore, vehicle: VehicleProfile? = nil, createsNew: Bool = false) {
         self.store = store
         self.vehicle = vehicle
         self.createsNew = createsNew
+        _isCreatingVehicle = State(initialValue: createsNew || (vehicle == nil && store.activeVehicleID == nil))
         let startingProfile = vehicle ?? (createsNew ? nil : store.profile)
         name = startingProfile?.name ?? "My EV"
         selectedConnectors = Set(startingProfile?.connectors ?? [])
@@ -2438,7 +2460,7 @@ struct VehicleProfileView: View {
         }
         .scrollContentBackground(.hidden)
         .background(Color.voltBackground)
-        .navigationTitle(createsNew ? "Add vehicle" : "Edit vehicle")
+        .navigationTitle(isCreatingVehicle ? "Add vehicle" : "Edit vehicle")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {
@@ -2468,9 +2490,11 @@ struct VehicleProfileView: View {
         }
         validationMessage = nil
         isSaving = true
+        let creating = isCreatingVehicle
+        let vehicleID = creating ? pendingVehicleID : (vehicle?.id ?? store.activeVehicleID)
         Task {
             let saved = await store.saveProfile(connectors: selectedConnectors, minimumPowerKW: power,
-                                                name: name, vehicleID: vehicle?.id, createsNew: createsNew)
+                                                name: name, vehicleID: vehicleID, createsNew: creating)
             isSaving = false
             if saved { dismiss() }
         }

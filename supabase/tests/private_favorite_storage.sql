@@ -1,7 +1,7 @@
 begin;
 
 -- These accounts and coordinates are synthetic. The transaction is rolled back by pgTAP.
-select plan(10);
+select plan(42);
 
 insert into auth.users (id, email, aud, role, encrypted_password, email_confirmed_at)
 values
@@ -98,6 +98,157 @@ select ok(
   (select count(*) = 0 from public.favorite_stations
    where station_id = 'private:44444444-4444-4444-8444-444444444444'),
   'a different account cannot read the private bookmark'
+);
+
+reset role;
+set local role authenticated;
+select set_config('request.jwt.claim.sub', '11111111-1111-4111-8111-111111111111', true);
+select set_config('request.jwt.claims', '{"sub":"11111111-1111-4111-8111-111111111111","email":"private-owner@example.invalid","role":"authenticated"}', true);
+select set_config(
+  'voltway.test_private_station',
+  '{"name":"Owner charger","address":"1 Test Road","operatorName":"Private owner","coordinate":{"latitude":3.139,"longitude":101.6869},"connectors":[{"kind":"ccs2","powerKW":50,"count":2}],"chargePointCount":2,"id":"spoofed","source":"gentari","sourceAttribution":"spoofed","access":"public","availability":{"state":"available"},"price":{"amount":1},"unexpected":"discard me"}',
+  true
+);
+
+select throws_ok(
+  $$select public.create_private_charger_site(null::uuid, current_setting('voltway.test_private_station')::jsonb, true)$$,
+  '22023', 'Private charger details are invalid', 'RPC rejects a missing site ID'
+);
+select throws_ok(
+  $$select public.create_private_charger_site(gen_random_uuid(), '[]'::jsonb, true)$$,
+  '22023', 'Private charger details are invalid', 'RPC rejects a non-object station'
+);
+select throws_ok(
+  $$select public.create_private_charger_site(gen_random_uuid(), current_setting('voltway.test_private_station')::jsonb - 'coordinate', true)$$,
+  '22023', 'Private charger details are invalid', 'RPC rejects missing coordinates'
+);
+select throws_ok(
+  $$select public.create_private_charger_site(gen_random_uuid(), jsonb_set(current_setting('voltway.test_private_station')::jsonb, '{coordinate,latitude}', '8'::jsonb), true)$$,
+  '22023', 'Private charger details are invalid', 'RPC rejects latitude outside Malaysia'
+);
+select throws_ok(
+  $$select public.create_private_charger_site(gen_random_uuid(), jsonb_set(current_setting('voltway.test_private_station')::jsonb, '{coordinate,longitude}', '121'::jsonb), true)$$,
+  '22023', 'Private charger details are invalid', 'RPC rejects longitude outside Malaysia'
+);
+select throws_ok(
+  $$select public.create_private_charger_site(gen_random_uuid(), jsonb_set(current_setting('voltway.test_private_station')::jsonb, '{coordinate,latitude}', '"3.139"'::jsonb), true)$$,
+  '22023', 'Private charger details are invalid', 'RPC rejects string latitude'
+);
+select throws_ok(
+  $$select public.create_private_charger_site(gen_random_uuid(), jsonb_set(current_setting('voltway.test_private_station')::jsonb, '{coordinate,longitude}', '"101.6869"'::jsonb), true)$$,
+  '22023', 'Private charger details are invalid', 'RPC rejects string longitude'
+);
+select throws_ok(
+  $$select public.create_private_charger_site(gen_random_uuid(), jsonb_set(current_setting('voltway.test_private_station')::jsonb, '{name}', '"   "'::jsonb), true)$$,
+  '22023', 'Private charger details are invalid', 'RPC rejects a blank name'
+);
+select throws_ok(
+  $$select public.create_private_charger_site(gen_random_uuid(), jsonb_set(current_setting('voltway.test_private_station')::jsonb, '{name}', to_jsonb(repeat('N', 101))), true)$$,
+  '22023', 'Private charger details are invalid', 'RPC rejects a name over 100 characters'
+);
+select throws_ok(
+  $$select public.create_private_charger_site(gen_random_uuid(), jsonb_set(current_setting('voltway.test_private_station')::jsonb, '{address}', '"  "'::jsonb), true)$$,
+  '22023', 'Private charger details are invalid', 'RPC rejects a blank address'
+);
+select throws_ok(
+  $$select public.create_private_charger_site(gen_random_uuid(), jsonb_set(current_setting('voltway.test_private_station')::jsonb, '{address}', to_jsonb(repeat('A', 241))), true)$$,
+  '22023', 'Private charger details are invalid', 'RPC rejects an address over 240 characters'
+);
+select throws_ok(
+  $$select public.create_private_charger_site(gen_random_uuid(), jsonb_set(current_setting('voltway.test_private_station')::jsonb, '{operatorName}', '""'::jsonb), true)$$,
+  '22023', 'Private charger details are invalid', 'RPC rejects a blank operator'
+);
+select throws_ok(
+  $$select public.create_private_charger_site(gen_random_uuid(), jsonb_set(current_setting('voltway.test_private_station')::jsonb, '{operatorName}', to_jsonb(repeat('O', 101))), true)$$,
+  '22023', 'Private charger details are invalid', 'RPC rejects an operator over 100 characters'
+);
+select throws_ok(
+  $$select public.create_private_charger_site(gen_random_uuid(), jsonb_set(current_setting('voltway.test_private_station')::jsonb, '{connectors}', '[]'::jsonb), true)$$,
+  '22023', 'Private charger details are invalid', 'RPC rejects an empty connector list'
+);
+select throws_ok(
+  $$select public.create_private_charger_site(gen_random_uuid(), jsonb_set(current_setting('voltway.test_private_station')::jsonb, '{connectors,0,kind}', '"nacs"'::jsonb), true)$$,
+  '22023', 'Private charger details are invalid', 'RPC rejects an unsupported connector'
+);
+select throws_ok(
+  $$select public.create_private_charger_site(gen_random_uuid(), jsonb_set(current_setting('voltway.test_private_station')::jsonb, '{connectors}', (select jsonb_agg(jsonb_build_object('kind', 'ccs2')) from generate_series(1, 21))), true)$$,
+  '22023', 'Private charger details are invalid', 'RPC caps connector objects at 20'
+);
+select throws_ok(
+  $$select public.create_private_charger_site(gen_random_uuid(), jsonb_set(current_setting('voltway.test_private_station')::jsonb, '{connectors,0,powerKW}', '0'::jsonb), true)$$,
+  '22023', 'Private charger details are invalid', 'RPC rejects zero connector power'
+);
+select throws_ok(
+  $$select public.create_private_charger_site(gen_random_uuid(), jsonb_set(current_setting('voltway.test_private_station')::jsonb, '{connectors,0,powerKW}', '1001'::jsonb), true)$$,
+  '22023', 'Private charger details are invalid', 'RPC rejects excessive connector power'
+);
+select throws_ok(
+  $$select public.create_private_charger_site(gen_random_uuid(), jsonb_set(current_setting('voltway.test_private_station')::jsonb, '{connectors,0,powerKW}', '"fast"'::jsonb), true)$$,
+  '22023', 'Private charger details are invalid', 'RPC rejects nonnumeric connector power'
+);
+select throws_ok(
+  $$select public.create_private_charger_site(gen_random_uuid(), jsonb_set(current_setting('voltway.test_private_station')::jsonb, '{connectors,0,count}', '0'::jsonb), true)$$,
+  '22023', 'Private charger details are invalid', 'RPC rejects zero connector count'
+);
+select throws_ok(
+  $$select public.create_private_charger_site(gen_random_uuid(), jsonb_set(current_setting('voltway.test_private_station')::jsonb, '{connectors,0,count}', '1.5'::jsonb), true)$$,
+  '22023', 'Private charger details are invalid', 'RPC rejects fractional connector count'
+);
+select throws_ok(
+  $$select public.create_private_charger_site(gen_random_uuid(), jsonb_set(current_setting('voltway.test_private_station')::jsonb, '{connectors,0,count}', '1001'::jsonb), true)$$,
+  '22023', 'Private charger details are invalid', 'RPC rejects excessive connector count'
+);
+select throws_ok(
+  $$select public.create_private_charger_site(gen_random_uuid(), jsonb_set(current_setting('voltway.test_private_station')::jsonb, '{chargePointCount}', '0'::jsonb), true)$$,
+  '22023', 'Private charger details are invalid', 'RPC rejects zero charge-point count'
+);
+select throws_ok(
+  $$select public.create_private_charger_site(gen_random_uuid(), jsonb_set(current_setting('voltway.test_private_station')::jsonb, '{chargePointCount}', '1.5'::jsonb), true)$$,
+  '22023', 'Private charger details are invalid', 'RPC rejects fractional charge-point count'
+);
+select throws_ok(
+  $$select public.create_private_charger_site(gen_random_uuid(), jsonb_set(current_setting('voltway.test_private_station')::jsonb, '{chargePointCount}', '"two"'::jsonb), true)$$,
+  '22023', 'Private charger details are invalid', 'RPC rejects string charge-point count'
+);
+select throws_ok(
+  $$select public.create_private_charger_site(gen_random_uuid(), current_setting('voltway.test_private_station')::jsonb, true, repeat('a', 255) || '@example.invalid')$$,
+  '22023', 'Invitation email is invalid', 'RPC caps invitation email length at 254'
+);
+select ok(
+  (select count(*) = 0 from public.private_charger_sites
+   where owner_id = auth.uid() and id <> '44444444-4444-4444-8444-444444444444'),
+  'invalid RPC submissions created no private sites'
+);
+select ok(
+  (select count(*) = 0 from public.private_charger_site_invites
+   where owner_id = auth.uid()),
+  'invalid RPC submissions created no invitations'
+);
+
+select is(
+  public.create_private_charger_site(
+    '66666666-6666-4666-8666-666666666666',
+    current_setting('voltway.test_private_station')::jsonb,
+    true,
+    ' INVITED@EXAMPLE.INVALID '
+  ),
+  '66666666-6666-4666-8666-666666666666'::uuid,
+  'valid owner submission returns its UUID'
+);
+select ok(
+  (select count(*) = 1 from public.private_charger_sites
+   where id = '66666666-6666-4666-8666-666666666666'),
+  'owner sees the saved site'
+);
+select is(
+  (select station from public.private_charger_sites where id = '66666666-6666-4666-8666-666666666666'),
+  '{"id":"private:66666666-6666-4666-8666-666666666666","name":"Owner charger","address":"1 Test Road","operatorName":"Private owner","coordinate":{"latitude":3.139,"longitude":101.6869},"connectors":[{"kind":"ccs2","powerKW":50,"count":2}],"chargePointCount":2,"source":"ownerProvided","sourceAttribution":"Owner supplied · shared by invitation","access":"private","availability":{"state":"unknown","availableConnectors":null,"totalConnectors":null,"lastUpdated":null},"price":null}'::jsonb,
+  'RPC stores only canonical site fields and server-controlled facts'
+);
+select is(
+  (select invited_email from public.private_charger_site_invites where site_id = '66666666-6666-4666-8666-666666666666'),
+  'invited@example.invalid',
+  'valid invitation is normalized and retained'
 );
 
 select * from finish();

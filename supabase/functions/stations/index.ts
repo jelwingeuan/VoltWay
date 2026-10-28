@@ -84,9 +84,15 @@ async function fetchGentari(): Promise<Station[] | null> {
       signal: AbortSignal.timeout(15_000),
     });
     if (!partnerResponse.ok) return null;
-    return stationArray(await partnerResponse.json())
+    const payload: unknown = await partnerResponse.json();
+    const rawStations = Array.isArray(payload) ? payload : isObject(payload)
+      ? [payload.stations, payload.locations, payload.data].find(Array.isArray) : null;
+    if (!rawStations) return null;
+    const stations = stationArray(payload)
       .map(normalizeGentari)
       .filter((station): station is Station => station !== null);
+    // An explicitly empty feed is valid; a nonempty feed with no usable stations is a broken adapter.
+    return rawStations.length === 0 || stations.length > 0 ? stations : null;
   } catch {
     return null;
   }

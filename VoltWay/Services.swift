@@ -251,7 +251,7 @@ actor BackendClient {
     }
 
     func saveFavorite(_ station: ChargingStation, session: UserSession) async throws {
-        let snapshot = station.id.hasPrefix("private:") || station.source == .ownerProvided ? nil : station
+        let snapshot = station.isPrivateSite ? nil : station
         let favorite = FavoriteStation(userID: session.userID, stationID: station.id, stationSnapshot: snapshot, createdAt: .now)
         let _: EmptyResponse = try await request(
             path: "rest/v1/favorite_stations",
@@ -610,6 +610,7 @@ enum CarPlaySnapshotStore {
         let snapshot = CarPlaySnapshot(stations: stations, favoriteStationIDs: favoriteStationIDs, savedAt: .now, isDemo: isDemo)
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = .sortedKeys
         defaults.set(try? encoder.encode(snapshot), forKey: key)
         if defaults === UserDefaults.standard {
             NotificationCenter.default.post(name: .voltWayCarPlaySnapshotDidChange, object: nil)
@@ -630,7 +631,19 @@ enum CarPlaySnapshotStore {
         }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        return (try? decoder.decode(CarPlaySnapshot.self, from: data)) ?? empty
+        guard let snapshot = try? decoder.decode(CarPlaySnapshot.self, from: data) else {
+            defaults.removeObject(forKey: key)
+            return empty
+        }
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = .sortedKeys
+        guard let safeData = try? encoder.encode(snapshot) else {
+            defaults.removeObject(forKey: key)
+            return empty
+        }
+        if safeData != data { defaults.set(safeData, forKey: key) }
+        return snapshot
     }
 }
 

@@ -4,6 +4,11 @@ import Observation
 @MainActor
 @Observable
 final class VoltWayStore {
+    private enum AccountRetryReason: Hashable {
+        case accountData
+        case vehicle(UUID)
+    }
+
     private(set) var session: UserSession?
     private(set) var profile: VehicleProfile
     private(set) var vehicles: [VehicleProfile]
@@ -43,6 +48,7 @@ final class VoltWayStore {
     @ObservationIgnored private var nextCompatibleStatusActivation: Date?
     @ObservationIgnored private var nextCompatibleStatusExpiry: Date?
     @ObservationIgnored private var favoriteSourceIDsByStationID: [String: Set<String>] = [:]
+    @ObservationIgnored private var accountRetryReasons: Set<AccountRetryReason> = []
 
     init(configuration: AppConfiguration = .current, backend: BackendClient? = nil) {
         self.backend = backend ?? BackendClient(configuration: configuration)
@@ -180,7 +186,7 @@ final class VoltWayStore {
         activeVehicleID = nil
         profile = VehicleProfile(connectors: [], minimumPowerKW: nil)
         isLoadingAccountData = false
-        accountDataNeedsRetry = false
+        clearAccountRetryReasons()
         favorites = []
         favoriteMutationIDs = []
         rebuildFavorites()
@@ -340,14 +346,24 @@ final class VoltWayStore {
             return false
         }
 
-        let previous = createsNew ? nil : vehicles.first { $0.id == (vehicleID ?? profile.id) }
+        let isCreating = createsNew || (vehicles.isEmpty && vehicleID == nil)
+        let previous = isCreating ? nil : vehicles.first { $0.id == (vehicleID ?? activeVehicleID ?? profile.id) }
+        let resolvedID: UUID
+        if isCreating {
+            resolvedID = vehicleID ?? UUID()
+        } else if let previous {
+            resolvedID = previous.id
+        } else {
+            errorMessage = "This vehicle is no longer in your account. Refresh account data and try again."
+            return false
+        }
         let vehicleName = (name ?? previous?.name ?? "My EV").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !vehicleName.isEmpty && vehicleName.count <= 60 else {
             errorMessage = "Vehicle name must be 1 to 60 characters."
             return false
         }
         let updated = VehicleProfile(
-            id: previous?.id ?? UUID(),
+            id: resolvedID,
             userID: session?.userID,
             name: vehicleName,
             connectors: connectors.sorted { $0.rawValue < $1.rawValue },
@@ -355,24 +371,75 @@ final class VoltWayStore {
             updatedAt: .now
         )
         let accountRevision = accountRevision
-        do {
-            if let session {
+        let userID = session?.userID
+        if let session {
+            do {
                 try await backend.saveProfile(updated, session: session)
-                if createsNew || vehicles.isEmpty { try await backend.setActiveVehicle(updated.id, session: session) }
+            } catch {
+                if isCurrentAccount(accountRevision, userID: userID) {
+                    if isCreating {
+                        // A failed response does not prove the upsert failed. The form keeps
+                        // this ID for retry; account sync can reveal a committed row after dismissal.
+                        requireAccountRetry(.vehicle(updated.id))
+                        errorMessage = "Vehicle save was not confirmed. Retry Save or sync account data to check it."
+                    } else {
+                        show(error)
+                    }
+                }
+                return false
             }
-            guard isCurrentAccount(accountRevision, userID: session?.userID) else { return false }
-            if let index = vehicles.firstIndex(where: { $0.id == updated.id }) { vehicles[index] = updated }
-            else { vehicles.append(updated) }
-            if createsNew || previous?.id == activeVehicleID || activeVehicleID == nil {
-                activeVehicleID = updated.id
-                profile = updated
-                rebuildCompatibleStations()
+            guard isCurrentAccount(accountRevision, userID: userID) else { return false }
+            if isCreating {
+                do {
+                    try await backend.setActiveVehicle(updated.id, session: session)
+                } catch {
+                    guard isCurrentAccount(accountRevision, userID: userID) else { return false }
+                    return await reconcileVehicleAfterSelectionFailure(updated.id, session: session, revision: accountRevision)
+                }
             }
+        }
+        guard isCurrentAccount(accountRevision, userID: userID) else { return false }
+        if let index = vehicles.firstIndex(where: { $0.id == updated.id }) { vehicles[index] = updated }
+        else { vehicles.append(updated) }
+        if isCreating {
+            activeVehicleID = updated.id
+            profile = updated
+            rebuildCompatibleStations()
+        } else if previous?.id == activeVehicleID {
+            profile = updated
+            rebuildCompatibleStations()
+        }
+        resolveAccountRetry(.vehicle(updated.id))
+        persistCarPlaySnapshot()
+        errorMessage = nil
+        return true
+    }
+
+    private func reconcileVehicleAfterSelectionFailure(_ savedID: UUID, session: UserSession, revision: Int) async -> Bool {
+        do {
+            let loadedProfiles = try await backend.loadProfiles(session: session)
+            guard isCurrentAccount(revision, userID: session.userID) else { return false }
+            let selectedID = try await backend.loadActiveVehicleID(session: session)
+            guard isCurrentAccount(revision, userID: session.userID) else { return false }
+            guard loadedProfiles.contains(where: { $0.id == savedID }) else {
+                requireAccountRetry(.vehicle(savedID))
+                errorMessage = "Vehicle save could not be verified. Retry account sync before continuing."
+                return false
+            }
+            resolveAccountRetry(.vehicle(savedID))
+            applyVehicleSelection(profiles: loadedProfiles, selectedID: selectedID, userID: session.userID)
             persistCarPlaySnapshot()
-            errorMessage = nil
-            return true
+            if selectedID == savedID {
+                errorMessage = nil
+                noticeMessage = "Vehicle saved. Active selection was confirmed after reloading."
+                return true
+            }
+            errorMessage = "Vehicle saved, but active selection was not confirmed. Retry Save to select it."
+            return false
         } catch {
-            if isCurrentAccount(accountRevision, userID: session?.userID) { show(error) }
+            guard isCurrentAccount(revision, userID: session.userID) else { return false }
+            requireAccountRetry(.vehicle(savedID))
+            errorMessage = "Vehicle saved, but account data could not be verified. Retry account sync before continuing."
             return false
         }
     }
@@ -431,7 +498,7 @@ final class VoltWayStore {
         if !matchingIDs.isEmpty {
             favorites.removeAll { matchingIDs.contains($0.stationID) }
         } else {
-            let snapshot = station.id.hasPrefix("private:") || station.source == .ownerProvided ? nil : station
+            let snapshot = station.isPrivateSite ? nil : station
             favorites.append(FavoriteStation(userID: session?.userID, stationID: station.id, stationSnapshot: snapshot, createdAt: .now))
         }
         rebuildFavorites()
@@ -464,7 +531,7 @@ final class VoltWayStore {
                         + previous.filter { matchingIDs.contains($0.stationID) }
                     rebuildFavorites()
                     persistCarPlaySnapshot()
-                    accountDataNeedsRetry = true
+                    requireAccountRetry(.accountData)
                     errorMessage = "Saved chargers could not be verified. Reload account data to check them."
                     return
                 }
@@ -488,6 +555,21 @@ final class VoltWayStore {
         noticeMessage = nil
     }
 
+    private func requireAccountRetry(_ reason: AccountRetryReason) {
+        accountRetryReasons.insert(reason)
+        accountDataNeedsRetry = true
+    }
+
+    private func resolveAccountRetry(_ reason: AccountRetryReason) {
+        accountRetryReasons.remove(reason)
+        accountDataNeedsRetry = !accountRetryReasons.isEmpty
+    }
+
+    private func clearAccountRetryReasons() {
+        accountRetryReasons.removeAll()
+        accountDataNeedsRetry = false
+    }
+
     func retryAccountData() async {
         guard let session, !isLoadingAccountData, !isSigningOut else { return }
         let revision = accountRevision
@@ -499,10 +581,9 @@ final class VoltWayStore {
         do {
             try await loadAccountData()
             guard isCurrentAccount(revision, userID: session.userID) else { return }
-            accountDataNeedsRetry = false
         } catch {
             guard isCurrentAccount(revision, userID: session.userID) else { return }
-            accountDataNeedsRetry = true
+            requireAccountRetry(.accountData)
             show(error)
         }
     }
@@ -517,22 +598,26 @@ final class VoltWayStore {
         async let loadedProfiles = backend.loadProfiles(session: session)
         async let loadedActiveID = backend.loadActiveVehicleID(session: session)
         async let loadedFavorites = backend.loadFavorites(session: session)
-        let profiles = try await loadedProfiles.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        let profiles = try await loadedProfiles
         let selectedID = try await loadedActiveID
         let loadedFavoritesResult = try await loadedFavorites
         guard isCurrentAccount(accountRevision, userID: session.userID) else { return }
-        vehicles = profiles
-        let selected = profiles.first(where: { $0.id == selectedID }) ?? profiles.first
-        activeVehicleID = selected?.id
-        profile = selected ?? VehicleProfile(userID: session.userID, connectors: [], minimumPowerKW: nil)
-        rebuildCompatibleStations()
+        applyVehicleSelection(profiles: profiles, selectedID: selectedID, userID: session.userID)
         favorites = loadedFavoritesResult
         rebuildFavorites()
         // The account is usable before the independent charger catalog finishes loading.
-        accountDataNeedsRetry = false
+        clearAccountRetryReasons()
         isLoadingAccountData = false
         isBootstrapping = false
         await refreshStations()
+    }
+
+    private func applyVehicleSelection(profiles: [VehicleProfile], selectedID: UUID?, userID: String) {
+        vehicles = profiles.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        let selected = vehicles.first { $0.id == selectedID }
+        activeVehicleID = selected?.id
+        profile = selected ?? VehicleProfile(userID: userID, connectors: [], minimumPowerKW: nil)
+        rebuildCompatibleStations()
     }
 
     func refreshAvailabilityOrderingIfNeeded(at date: Date) {

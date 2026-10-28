@@ -493,6 +493,52 @@ struct VoltWayTests {
         #expect(snapshot.favoriteStationIDs == [publicStation.id])
     }
 
+    @Test("CarPlay excludes private sites when either access or ID identifies them")
+    @MainActor func privateSitesWithoutSourceStayOutOfCarPlay() throws {
+        let publicStation = DemoData.stations[0]
+        func site(id: String, access: StationAccess?) -> ChargingStation {
+            ChargingStation(
+                id: id, name: "Private depot", address: "Kuala Lumpur",
+                coordinate: Coordinate(latitude: 3.14, longitude: 101.68), operatorName: "Workplace",
+                connectors: [Connector(kind: .type2, powerKW: 22, count: 1)],
+                availability: Availability(state: .unknown, availableConnectors: nil,
+                                           totalConnectors: nil, lastUpdated: nil),
+                price: nil, access: access
+            )
+        }
+        let privateByID = site(id: "private:site-1", access: nil)
+        let privateByAccess = site(id: "site-2", access: .privateAccess)
+        let stations = [publicStation, privateByID, privateByAccess]
+        let favoriteIDs = Set(stations.map(\.id))
+
+        let snapshot = CarPlaySnapshot(stations: stations, favoriteStationIDs: favoriteIDs, savedAt: now)
+        #expect(snapshot.stations.map(\.id) == [publicStation.id])
+        #expect(snapshot.favoriteStationIDs == [publicStation.id])
+
+        // Older snapshots may already contain a private record, so decoding must scrub it too.
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        var object = try #require(JSONSerialization.jsonObject(with: encoder.encode(snapshot)) as? [String: Any])
+        object["stations"] = try JSONSerialization.jsonObject(with: encoder.encode(stations))
+        object["favoriteStationIDs"] = Array(favoriteIDs)
+        let legacyData = try JSONSerialization.data(withJSONObject: object)
+        let restored = try decoder.decode(CarPlaySnapshot.self, from: legacyData)
+        #expect(restored.stations.map(\.id) == [publicStation.id])
+        #expect(restored.favoriteStationIDs == [publicStation.id])
+
+        let defaults = try #require(UserDefaults(suiteName: "VoltWayTests.\(UUID().uuidString)"))
+        defaults.set(legacyData, forKey: "carplay-snapshot")
+        let loaded = CarPlaySnapshotStore.load(defaults: defaults)
+        #expect(loaded.stations.map(\.id) == [publicStation.id])
+        let storedData = try #require(defaults.data(forKey: "carplay-snapshot"))
+        let storedObject = try #require(JSONSerialization.jsonObject(with: storedData) as? [String: Any])
+        let storedStations = try #require(storedObject["stations"] as? [[String: Any]])
+        #expect(storedStations.compactMap { $0["id"] as? String } == [publicStation.id])
+        #expect(Set(storedObject["favoriteStationIDs"] as? [String] ?? []) == [publicStation.id])
+    }
+
     @Test("Older CarPlay snapshots without a demo field remain readable")
     func legacyCarPlaySnapshot() throws {
         let encoder = JSONEncoder()
@@ -539,6 +585,30 @@ struct VoltWayTests {
         let object = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(favorite)) as? [String: Any])
         #expect(object["station_id"] as? String == privateStation.id)
         #expect(object["station_snapshot"] is NSNull)
+    }
+
+    @Test("Private access removes a favorite coordinate even when source and ID look public")
+    func privateAccessFavoriteStoresOnlyID() throws {
+        let station = ChargingStation(
+            id: "site-2", name: "Private depot", address: "Kuala Lumpur",
+            coordinate: Coordinate(latitude: 3.14, longitude: 101.68), operatorName: "Workplace",
+            connectors: [Connector(kind: .type2, powerKW: 22, count: 1)],
+            availability: Availability(state: .unknown, availableConnectors: nil,
+                                       totalConnectors: nil, lastUpdated: nil),
+            price: nil, access: .privateAccess
+        )
+        let favorite = FavoriteStation(userID: "user-1", stationID: station.id,
+                                       stationSnapshot: station, createdAt: nil)
+        let encoder = JSONEncoder()
+        let object = try #require(JSONSerialization.jsonObject(with: encoder.encode(favorite)) as? [String: Any])
+        #expect(object["station_snapshot"] is NSNull)
+
+        // Older rows may still carry a full station; scrub it when decoding.
+        var legacyObject = object
+        legacyObject["station_snapshot"] = try JSONSerialization.jsonObject(with: encoder.encode(station))
+        let decoded = try JSONDecoder().decode(FavoriteStation.self,
+            from: JSONSerialization.data(withJSONObject: legacyObject))
+        #expect(decoded.stationSnapshot == nil)
     }
 
     @Test("Nullable private favorite rows decode and re-encode with an explicit null")
@@ -768,8 +838,9 @@ struct BackendClientTests {
         #expect(store.accountDataNeedsRetry == false)
         #expect(store.isLoadingAccountData == false)
         #expect(store.errorMessage == nil)
-        #expect(store.profile.name == "Daily EV")
         #expect(store.vehicles.map(\.id) == [profile.id])
+        #expect(store.activeVehicleID == nil)
+        #expect(store.profile.connectors.isEmpty)
         #expect(profileRequests.value == 2)
         await store.signOut()
     }
@@ -1721,6 +1792,60 @@ struct BackendClientTests {
         try await client.signOut()
     }
 
+    @Test("Private access favorites keep coordinates out of optimistic state, requests, and CarPlay")
+    @MainActor func privateAccessFavoriteThroughStore() async throws {
+        let station = ChargingStation(
+            id: "site-private-access", name: "Private depot", address: "Kuala Lumpur",
+            coordinate: Coordinate(latitude: 3.14, longitude: 101.68), operatorName: "Workplace",
+            connectors: [Connector(kind: .type2, powerKW: 22, count: 1)],
+            availability: Availability(state: .unknown, availableConnectors: nil,
+                                       totalConnectors: nil, lastUpdated: nil),
+            price: nil, access: .privateAccess
+        )
+        let profile = VehicleProfile(userID: "user-1", name: "City EV",
+                                     connectors: [.type2], minimumPowerKW: nil)
+        let encoder = JSONEncoder()
+        let profiles = try encoder.encode([profile])
+        let preference = try encoder.encode([ActiveVehiclePreference(userID: "user-1", activeVehicleID: profile.id)])
+        let stations = Data(#"{"stations":"#.utf8) + (try encoder.encode([station])) + Data("}".utf8)
+        let postedFavorite = Mutex<Data?>(nil)
+        MockURLProtocol.handler = { request in
+            switch (request.url?.path, request.httpMethod) {
+            case ("/auth/v1/token", _):
+                return (200, Data(#"{"access_token":"fresh","refresh_token":"refresh-1","user":{"id":"user-1","email":"driver@example.com"}}"#.utf8))
+            case ("/rest/v1/vehicle_profiles", "GET"):
+                return (200, profiles)
+            case ("/rest/v1/user_preferences", "GET"):
+                return (200, preference)
+            case ("/rest/v1/favorite_stations", "GET"):
+                return (200, Data("[]".utf8))
+            case ("/rest/v1/favorite_stations", "POST"):
+                postedFavorite.withLock { $0 = MockURLProtocol.bodyData(for: request) }
+                return (204, Data())
+            case ("/functions/v1/stations", _):
+                return (200, stations)
+            default:
+                return (200, Data("[]".utf8))
+            }
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let store = VoltWayStore(configuration: configuration, backend: makeClient(account: "test-\(UUID().uuidString)"))
+        await store.signIn(email: "driver@example.com", password: "password-123")
+        #expect(store.compatibleStations.map(\.id) == [station.id])
+        #expect(CarPlaySnapshotStore.load().stations.isEmpty)
+
+        await store.toggleFavorite(station)
+        #expect(store.favorites.first?.stationSnapshot == nil)
+        #expect(store.favoriteStations.map(\.id) == [station.id])
+        #expect(CarPlaySnapshotStore.load().stations.isEmpty)
+        let body = try #require(postedFavorite.withLock { $0 })
+        let object = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        #expect(object["station_id"] as? String == station.id)
+        #expect(object["station_snapshot"] is NSNull)
+        await store.signOut()
+    }
+
     @Test("Concurrent expired-token requests share one refresh and persist rotated tokens")
     func concurrentRefresh() async throws {
         let refreshes = LockedCounter()
@@ -1845,10 +1970,346 @@ struct BackendClientTests {
         #expect(store.profile == previous)
         #expect(store.vehicles.first?.name == "Existing EV")
         #expect(store.lastSuccessfulStationFetchAt == previousFetchAt)
+        #expect(store.accountDataNeedsRetry == false)
         #expect(store.errorMessage == "Save failed")
         CarPlaySnapshotStore.save(stations: [DemoData.stations[0]], favoriteStationIDs: [])
         await store.signOut()
         #expect(CarPlaySnapshotStore.load().stations.isEmpty)
+    }
+
+    @Test("A vehicle saved before active selection fails is reconciled and retried with one ID")
+    @MainActor func partialVehicleSaveUsesStableID() async throws {
+        let vehicleID = UUID(uuidString: "00000000-0000-0000-0000-000000000051")!
+        let server = VehicleMockServer(failingPreferenceResponses: 1)
+        MockURLProtocol.handler = { server.respond(to: $0) }
+        defer { MockURLProtocol.handler = nil }
+
+        let store = VoltWayStore(configuration: configuration, backend: makeClient(account: "test-\(UUID().uuidString)"))
+        await store.signIn(email: "driver@example.com", password: "password-123")
+        #expect(store.vehicles.isEmpty)
+        #expect(store.activeVehicleID == nil)
+
+        let firstSave = await store.saveProfile(connectors: [.ccs2], minimumPowerKW: 100,
+                                                name: "Highway EV", vehicleID: vehicleID, createsNew: true)
+        let afterFailure = server.snapshot
+        #expect(firstSave == false)
+        #expect(afterFailure.profiles.map(\.id) == [vehicleID])
+        #expect(afterFailure.profilePostIDs == [vehicleID])
+        #expect(afterFailure.preferencePostIDs == [vehicleID])
+        #expect(store.vehicles.map(\.id) == [vehicleID])
+        #expect(store.activeVehicleID == nil)
+        #expect(store.profile.connectors.isEmpty)
+        #expect(store.errorMessage == "Vehicle saved, but active selection was not confirmed. Retry Save to select it.")
+        #expect(store.accountDataNeedsRetry == false)
+        #expect(afterFailure.stationRequests == 1, "Reconciliation must not reload the charger catalog")
+
+        let secondSave = await store.saveProfile(connectors: [.ccs2], minimumPowerKW: 100,
+                                                 name: "Highway EV", vehicleID: vehicleID, createsNew: true)
+        let afterRetry = server.snapshot
+        #expect(secondSave)
+        #expect(afterRetry.profiles.map(\.id) == [vehicleID])
+        #expect(afterRetry.profilePostIDs == [vehicleID, vehicleID])
+        #expect(afterRetry.preferencePostIDs == [vehicleID, vehicleID])
+        #expect(afterRetry.stationRequests == 1)
+        #expect(store.activeVehicleID == vehicleID)
+        #expect(store.profile.id == vehicleID)
+        await store.signOut()
+    }
+
+    @Test("A failed new-vehicle selection leaves the prior active vehicle selected")
+    @MainActor func partialVehicleSavePreservesPriorSelection() async throws {
+        let prior = VehicleProfile(id: UUID(uuidString: "00000000-0000-0000-0000-000000000052")!, userID: "user-1",
+                                   name: "Daily EV", connectors: [.type2], minimumPowerKW: nil)
+        let newID = UUID(uuidString: "00000000-0000-0000-0000-000000000053")!
+        let server = VehicleMockServer(profiles: [prior], activeVehicleID: prior.id, failingPreferenceResponses: 1)
+        MockURLProtocol.handler = { server.respond(to: $0) }
+        defer { MockURLProtocol.handler = nil }
+
+        let store = VoltWayStore(configuration: configuration, backend: makeClient(account: "test-\(UUID().uuidString)"))
+        await store.signIn(email: "driver@example.com", password: "password-123")
+        let saved = await store.saveProfile(connectors: [.ccs2], minimumPowerKW: 80,
+                                            name: "Road EV", vehicleID: newID, createsNew: true)
+        #expect(saved == false)
+        #expect(store.vehicles.map(\.id).contains(newID))
+        #expect(store.activeVehicleID == prior.id)
+        #expect(store.profile == prior)
+        #expect(server.snapshot.stationRequests == 1)
+        await store.signOut()
+    }
+
+    @Test("A lost active-selection response is acknowledged after the server confirms it")
+    @MainActor func committedVehiclePreferenceResponseLost() async throws {
+        let vehicleID = UUID(uuidString: "00000000-0000-0000-0000-000000000060")!
+        let server = VehicleMockServer(committingPreferenceResponseFailures: 1)
+        MockURLProtocol.handler = { server.respond(to: $0) }
+        defer { MockURLProtocol.handler = nil }
+
+        let store = VoltWayStore(configuration: configuration, backend: makeClient(account: "test-\(UUID().uuidString)"))
+        await store.signIn(email: "driver@example.com", password: "password-123")
+        let saved = await store.saveProfile(connectors: [.ccs2], minimumPowerKW: nil,
+                                            name: "Confirmed EV", vehicleID: vehicleID, createsNew: true)
+        #expect(saved)
+        #expect(server.snapshot.profiles.map(\.id) == [vehicleID])
+        #expect(store.activeVehicleID == vehicleID)
+        #expect(store.profile.id == vehicleID)
+        #expect(store.errorMessage == nil)
+        #expect(store.noticeMessage == "Vehicle saved. Active selection was confirmed after reloading.")
+        await store.signOut()
+    }
+
+    @Test("A failed vehicle reconciliation requests account sync without claiming the remote profile")
+    @MainActor func failedVehicleReconciliationNeedsAccountRetry() async throws {
+        let vehicleID = UUID(uuidString: "00000000-0000-0000-0000-000000000061")!
+        let server = VehicleMockServer(failingPreferenceResponses: 1, failingReconciliationReads: 1)
+        MockURLProtocol.handler = { server.respond(to: $0) }
+        defer { MockURLProtocol.handler = nil }
+
+        let store = VoltWayStore(configuration: configuration, backend: makeClient(account: "test-\(UUID().uuidString)"))
+        await store.signIn(email: "driver@example.com", password: "password-123")
+        let saved = await store.saveProfile(connectors: [.ccs2], minimumPowerKW: nil,
+                                            name: "Unverified EV", vehicleID: vehicleID, createsNew: true)
+        #expect(saved == false)
+        #expect(server.snapshot.profiles.map(\.id) == [vehicleID])
+        #expect(store.vehicles.isEmpty)
+        #expect(store.activeVehicleID == nil)
+        #expect(store.accountDataNeedsRetry)
+        #expect(store.errorMessage == "Vehicle saved, but account data could not be verified. Retry account sync before continuing.")
+        #expect(server.snapshot.stationRequests == 1)
+
+        await store.retryAccountData()
+        #expect(store.accountDataNeedsRetry == false)
+        #expect(store.vehicles.map(\.id) == [vehicleID])
+        #expect(store.activeVehicleID == nil)
+        await store.signOut()
+    }
+
+    @Test("Vehicle reconciliation does not dismiss an unrelated saved-charger sync warning")
+    @MainActor func vehicleReconciliationPreservesFavoriteRetry() async throws {
+        let vehicleID = UUID(uuidString: "00000000-0000-0000-0000-000000000062")!
+        let server = VehicleMockServer(failingPreferenceResponses: 1, failingFavoriteReads: 1)
+        MockURLProtocol.handler = { server.respond(to: $0) }
+        defer { MockURLProtocol.handler = nil }
+
+        let store = VoltWayStore(configuration: configuration, backend: makeClient(account: "test-\(UUID().uuidString)"))
+        await store.signIn(email: "driver@example.com", password: "password-123")
+        #expect(store.accountDataNeedsRetry)
+        let saved = await store.saveProfile(connectors: [.ccs2], minimumPowerKW: nil,
+                                            name: "New EV", vehicleID: vehicleID, createsNew: true)
+        #expect(saved == false)
+        #expect(store.vehicles.map(\.id) == [vehicleID])
+        #expect(store.activeVehicleID == nil)
+        #expect(store.accountDataNeedsRetry, "Vehicle reads cannot confirm saved-charger state")
+        let retrySaved = await store.saveProfile(connectors: [.ccs2], minimumPowerKW: nil,
+                                                 name: "New EV", vehicleID: vehicleID, createsNew: true)
+        #expect(retrySaved)
+        #expect(store.activeVehicleID == vehicleID)
+        #expect(store.accountDataNeedsRetry, "A confirmed vehicle save cannot clear the unrelated saved-charger warning")
+        await store.signOut()
+    }
+
+    @Test("A null preference never becomes a confirmed active vehicle after bootstrap")
+    @MainActor func nilVehiclePreferenceSurvivesRestart() async throws {
+        let unselected = VehicleProfile(id: UUID(uuidString: "00000000-0000-0000-0000-000000000054")!, userID: "user-1",
+                                        name: "Unselected EV", connectors: [.ccs2], minimumPowerKW: nil)
+        let server = VehicleMockServer(profiles: [unselected], activeVehicleID: nil)
+        MockURLProtocol.handler = { server.respond(to: $0) }
+        defer { MockURLProtocol.handler = nil }
+
+        let client = makeClient(account: "test-\(UUID().uuidString)")
+        let firstStore = VoltWayStore(configuration: configuration, backend: client)
+        await firstStore.signIn(email: "driver@example.com", password: "password-123")
+        #expect(firstStore.vehicles.map(\.id) == [unselected.id])
+        #expect(firstStore.activeVehicleID == nil)
+        #expect(firstStore.profile.connectors.isEmpty)
+
+        let restoredStore = VoltWayStore(configuration: configuration, backend: client)
+        await restoredStore.bootstrap()
+        #expect(restoredStore.vehicles.map(\.id) == [unselected.id])
+        #expect(restoredStore.activeVehicleID == nil)
+        #expect(restoredStore.profile.connectors.isEmpty)
+        await restoredStore.signOut()
+    }
+
+    @Test("A lost profile-save response can be retried without creating another vehicle")
+    @MainActor func lostProfileResponseRetryUsesStableID() async throws {
+        let vehicleID = UUID(uuidString: "00000000-0000-0000-0000-000000000055")!
+        let server = VehicleMockServer(failingProfileResponses: 1)
+        MockURLProtocol.handler = { server.respond(to: $0) }
+        defer { MockURLProtocol.handler = nil }
+
+        let store = VoltWayStore(configuration: configuration, backend: makeClient(account: "test-\(UUID().uuidString)"))
+        await store.signIn(email: "driver@example.com", password: "password-123")
+        let firstSave = await store.saveProfile(connectors: [.ccs2], minimumPowerKW: nil,
+                                                name: "Retry EV", vehicleID: vehicleID, createsNew: true)
+        #expect(firstSave == false)
+        #expect(server.snapshot.profiles.map(\.id) == [vehicleID])
+        #expect(store.accountDataNeedsRetry)
+        #expect(store.errorMessage == "Vehicle save was not confirmed. Retry Save or sync account data to check it.")
+
+        let secondSave = await store.saveProfile(connectors: [.ccs2], minimumPowerKW: nil,
+                                                 name: "Retry EV", vehicleID: vehicleID, createsNew: true)
+        let afterRetry = server.snapshot
+        #expect(secondSave)
+        #expect(afterRetry.profiles.map(\.id) == [vehicleID])
+        #expect(afterRetry.profilePostIDs == [vehicleID, vehicleID])
+        #expect(afterRetry.preferencePostIDs == [vehicleID])
+        #expect(store.activeVehicleID == vehicleID)
+        #expect(store.accountDataNeedsRetry == false, "A confirmed retry resolves its own vehicle-sync warning")
+        await store.signOut()
+    }
+
+    @Test("A lost create response can be recovered by account sync if the form is dismissed")
+    @MainActor func lostVehicleResponseCanRecoverWithoutRetryingForm() async throws {
+        let vehicleID = UUID(uuidString: "00000000-0000-0000-0000-000000000063")!
+        let server = VehicleMockServer(failingProfileResponses: 1)
+        MockURLProtocol.handler = { server.respond(to: $0) }
+        defer { MockURLProtocol.handler = nil }
+
+        let store = VoltWayStore(configuration: configuration, backend: makeClient(account: "test-\(UUID().uuidString)"))
+        await store.signIn(email: "driver@example.com", password: "password-123")
+        let saved = await store.saveProfile(connectors: [.ccs2], minimumPowerKW: nil,
+                                            name: "Recovered EV", vehicleID: vehicleID, createsNew: true)
+        #expect(saved == false)
+        #expect(store.accountDataNeedsRetry)
+        #expect(store.vehicles.isEmpty)
+        #expect(server.snapshot.profilePostIDs == [vehicleID])
+        #expect(server.snapshot.preferencePostIDs.isEmpty)
+        #expect(server.snapshot.stationRequests == 1, "The failed create must not reload the charger catalog")
+
+        await store.retryAccountData()
+        #expect(store.accountDataNeedsRetry == false)
+        #expect(store.vehicles.map(\.id) == [vehicleID])
+        #expect(store.activeVehicleID == nil)
+        #expect(server.snapshot.preferencePostIDs.isEmpty)
+        await store.signOut()
+    }
+
+    @Test("Editing a vehicle removed from the current account never creates a replacement")
+    @MainActor func staleVehicleEditIsRejected() async throws {
+        let prior = VehicleProfile(id: UUID(uuidString: "00000000-0000-0000-0000-000000000056")!, userID: "user-1",
+                                   name: "Current EV", connectors: [.type2], minimumPowerKW: nil)
+        let removedID = UUID(uuidString: "00000000-0000-0000-0000-000000000057")!
+        let server = VehicleMockServer(profiles: [prior], activeVehicleID: prior.id)
+        MockURLProtocol.handler = { server.respond(to: $0) }
+        defer { MockURLProtocol.handler = nil }
+
+        let store = VoltWayStore(configuration: configuration, backend: makeClient(account: "test-\(UUID().uuidString)"))
+        await store.signIn(email: "driver@example.com", password: "password-123")
+        let saved = await store.saveProfile(connectors: [.ccs2], minimumPowerKW: 100,
+                                            name: "Removed EV", vehicleID: removedID)
+        #expect(saved == false)
+        #expect(server.snapshot.profilePostIDs.isEmpty)
+        #expect(store.vehicles.map(\.id) == [prior.id])
+        #expect(store.activeVehicleID == prior.id)
+        #expect(store.errorMessage == "This vehicle is no longer in your account. Refresh account data and try again.")
+        await store.signOut()
+    }
+
+    @Test("A stale profile save cannot send active selection after the account session changes")
+    @MainActor func accountChangeBeforeVehiclePreferenceWrite() async throws {
+        let profilePosts = LockedCounter()
+        let releaseProfile = DispatchSemaphore(value: 0)
+        let server = VehicleMockServer()
+        let authRequests = LockedCounter()
+        MockURLProtocol.handler = { request in
+            if request.url?.path == "/auth/v1/token" {
+                authRequests.increment()
+                let access = authRequests.value == 1 ? "first" : "second"
+                return (200, Data("{\"access_token\":\"\(access)\",\"refresh_token\":\"refresh-1\",\"user\":{\"id\":\"user-1\",\"email\":\"driver@example.com\"}}".utf8))
+            }
+            if request.url?.path == "/rest/v1/vehicle_profiles", request.httpMethod == "POST" {
+                profilePosts.increment()
+                _ = releaseProfile.wait(timeout: .now() + 10)
+            }
+            return server.respond(to: request)
+        }
+        defer {
+            releaseProfile.signal()
+            MockURLProtocol.handler = nil
+        }
+
+        let store = VoltWayStore(configuration: configuration, backend: makeClient(account: "test-\(UUID().uuidString)"))
+        await store.signIn(email: "driver@example.com", password: "password-123")
+        let pendingSave = Task {
+            await store.saveProfile(connectors: [.ccs2], minimumPowerKW: nil,
+                                    name: "Old session EV", vehicleID: UUID(), createsNew: true)
+        }
+        try await waitForRequest(profilePosts)
+        await store.signOut()
+        await store.signIn(email: "driver@example.com", password: "password-123")
+        releaseProfile.signal()
+        let saved = await pendingSave.value
+        #expect(saved == false)
+        #expect(server.snapshot.preferencePostIDs.isEmpty)
+        #expect(store.session?.accessToken == "second")
+        #expect(store.activeVehicleID == nil)
+        await store.signOut()
+    }
+
+    @Test("An old account's reconciliation cannot overwrite the newly signed-in account")
+    @MainActor func accountChangeDuringVehicleReconciliation() async throws {
+        let oldID = UUID(uuidString: "00000000-0000-0000-0000-000000000058")!
+        let newID = UUID(uuidString: "00000000-0000-0000-0000-000000000059")!
+        let oldVehicle = VehicleProfile(id: oldID, userID: "user-1", name: "Old account EV",
+                                        connectors: [.ccs2], minimumPowerKW: nil)
+        let newVehicle = VehicleProfile(id: newID, userID: "user-2", name: "New account EV",
+                                        connectors: [.type2], minimumPowerKW: nil)
+        let oldProfiles = try JSONEncoder().encode([oldVehicle])
+        let newProfiles = try JSONEncoder().encode([newVehicle])
+        let newPreference = try JSONEncoder().encode([ActiveVehiclePreference(userID: "user-2", activeVehicleID: newID)])
+        let authRequests = LockedCounter()
+        let oldProfileReads = LockedCounter()
+        let releaseOldRead = DispatchSemaphore(value: 0)
+        MockURLProtocol.handler = { request in
+            let path = request.url?.path ?? ""
+            let userFilter = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?
+                .queryItems?.first(where: { $0.name == "user_id" })?.value
+            if path == "/auth/v1/token" {
+                authRequests.increment()
+                let user = authRequests.value == 1 ? "user-1" : "user-2"
+                return (200, Data("{\"access_token\":\"\(user)\",\"refresh_token\":\"refresh-1\",\"user\":{\"id\":\"\(user)\",\"email\":\"driver@example.com\"}}".utf8))
+            }
+            if path == "/rest/v1/vehicle_profiles", request.httpMethod == "GET" {
+                if userFilter == "eq.user-1" {
+                    oldProfileReads.increment()
+                    if oldProfileReads.value == 1 { return (200, Data("[]".utf8)) }
+                    _ = releaseOldRead.wait(timeout: .now() + 10)
+                    return (200, oldProfiles)
+                }
+                return (200, newProfiles)
+            }
+            if path == "/rest/v1/vehicle_profiles", request.httpMethod == "POST" { return (204, Data()) }
+            if path == "/rest/v1/user_preferences", request.httpMethod == "GET" {
+                return userFilter == "eq.user-1" ? (200, Data("[]".utf8)) : (200, newPreference)
+            }
+            if path == "/rest/v1/user_preferences", request.httpMethod == "POST" {
+                return (503, Data(#"{"message":"Selection failed"}"#.utf8))
+            }
+            if path == "/functions/v1/stations" { return (200, Data(#"{"stations":[]}"#.utf8)) }
+            if path == "/rest/v1/favorite_stations" { return (200, Data("[]".utf8)) }
+            return (404, Data())
+        }
+        defer {
+            releaseOldRead.signal()
+            MockURLProtocol.handler = nil
+        }
+
+        let store = VoltWayStore(configuration: configuration, backend: makeClient(account: "test-\(UUID().uuidString)"))
+        await store.signIn(email: "driver@example.com", password: "password-123")
+        let oldSave = Task {
+            await store.saveProfile(connectors: [.ccs2], minimumPowerKW: nil,
+                                    name: oldVehicle.name, vehicleID: oldID, createsNew: true)
+        }
+        try await waitForRequest(oldProfileReads, count: 2)
+        await store.signOut()
+        await store.signIn(email: "driver@example.com", password: "password-123")
+        releaseOldRead.signal()
+        #expect(await oldSave.value == false)
+        #expect(store.session?.userID == "user-2")
+        #expect(store.vehicles.map(\.id) == [newID])
+        #expect(store.activeVehicleID == newID)
+        #expect(store.profile.id == newID)
+        await store.signOut()
     }
 
     private func makeClient(account: String) -> BackendClient {
@@ -1875,8 +2336,122 @@ private final class InMemoryCredentialStore: SessionCredentialStore {
     }
 }
 
+private struct VehicleMockState: Sendable {
+    var profiles: [VehicleProfile]
+    var activeVehicleID: UUID?
+    var profilePostIDs: [UUID] = []
+    var preferencePostIDs: [UUID?] = []
+    var stationRequests = 0
+    var failingProfileResponses: Int
+    var failingPreferenceResponses: Int
+    var committingPreferenceResponseFailures: Int
+    var failingReconciliationReads: Int
+    var failingFavoriteReads: Int
+}
+
+private final class VehicleMockServer: Sendable {
+    private let state: Mutex<VehicleMockState>
+
+    init(profiles: [VehicleProfile] = [], activeVehicleID: UUID? = nil,
+         failingProfileResponses: Int = 0, failingPreferenceResponses: Int = 0,
+         committingPreferenceResponseFailures: Int = 0, failingReconciliationReads: Int = 0,
+         failingFavoriteReads: Int = 0) {
+        state = Mutex(VehicleMockState(profiles: profiles, activeVehicleID: activeVehicleID,
+                                       failingProfileResponses: failingProfileResponses,
+                                       failingPreferenceResponses: failingPreferenceResponses,
+                                       committingPreferenceResponseFailures: committingPreferenceResponseFailures,
+                                       failingReconciliationReads: failingReconciliationReads,
+                                       failingFavoriteReads: failingFavoriteReads))
+    }
+
+    var snapshot: VehicleMockState { state.withLock { $0 } }
+
+    func respond(to request: URLRequest) -> (Int, Data) {
+        let path = request.url?.path ?? ""
+        switch (path, request.httpMethod) {
+        case ("/auth/v1/token", _):
+            return (200, Data(#"{"access_token":"fresh","refresh_token":"refresh-1","user":{"id":"user-1","email":"driver@example.com"}}"#.utf8))
+        case ("/rest/v1/vehicle_profiles", "GET"):
+            let profiles = state.withLock { state -> [VehicleProfile]? in
+                if !state.profilePostIDs.isEmpty && state.failingReconciliationReads > 0 {
+                    state.failingReconciliationReads -= 1
+                    return nil
+                }
+                return state.profiles
+            }
+            guard let profiles else { return (503, Data(#"{"message":"Profiles unavailable"}"#.utf8)) }
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .iso8601
+            guard let data = try? encoder.encode(profiles) else { return (500, Data()) }
+            return (200, data)
+        case ("/rest/v1/vehicle_profiles", "POST"):
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            guard let profile = try? decoder.decode(VehicleProfile.self, from: MockURLProtocol.bodyData(for: request)) else {
+                return (422, Data(#"{"message":"Invalid vehicle profile"}"#.utf8))
+            }
+            let fails = state.withLock { state in
+                if let index = state.profiles.firstIndex(where: { $0.id == profile.id }) { state.profiles[index] = profile }
+                else { state.profiles.append(profile) }
+                state.profilePostIDs.append(profile.id)
+                if state.failingProfileResponses > 0 {
+                    state.failingProfileResponses -= 1
+                    return true
+                }
+                return false
+            }
+            return fails ? (503, Data(#"{"message":"Profile response lost"}"#.utf8)) : (204, Data())
+        case ("/rest/v1/user_preferences", "GET"):
+            let activeID = state.withLock { $0.activeVehicleID }
+            let preference = ActiveVehiclePreference(userID: "user-1", activeVehicleID: activeID)
+            guard let data = try? JSONEncoder().encode([preference]) else { return (500, Data()) }
+            return (200, data)
+        case ("/rest/v1/user_preferences", "POST"):
+            guard let preference = try? JSONDecoder().decode(ActiveVehiclePreference.self,
+                                                              from: MockURLProtocol.bodyData(for: request)) else {
+                return (422, Data(#"{"message":"Invalid vehicle preference"}"#.utf8))
+            }
+            let fails = state.withLock { state in
+                state.preferencePostIDs.append(preference.activeVehicleID)
+                if state.failingPreferenceResponses > 0 {
+                    state.failingPreferenceResponses -= 1
+                    return true
+                }
+                state.activeVehicleID = preference.activeVehicleID
+                if state.committingPreferenceResponseFailures > 0 {
+                    state.committingPreferenceResponseFailures -= 1
+                    return true
+                }
+                return false
+            }
+            return fails ? (503, Data(#"{"message":"Selection failed"}"#.utf8)) : (204, Data())
+        case ("/rest/v1/favorite_stations", "GET"):
+            let fails = state.withLock { state in
+                if state.failingFavoriteReads > 0 {
+                    state.failingFavoriteReads -= 1
+                    return true
+                }
+                return false
+            }
+            if fails { return (503, Data(#"{"message":"Favorites unavailable"}"#.utf8)) }
+            return (200, Data("[]".utf8))
+        case ("/functions/v1/stations", "GET"):
+            state.withLock { $0.stationRequests += 1 }
+            return (200, Data(#"{"stations":[]}"#.utf8))
+        default:
+            return (404, Data(#"{"message":"Unexpected vehicle test request"}"#.utf8))
+        }
+    }
+}
+
 private final class MockURLProtocol: URLProtocol, @unchecked Sendable {
-    nonisolated(unsafe) static var handler: (@Sendable (URLRequest) -> (Int, Data))?
+    private static let handlerState = Mutex<(@Sendable (URLRequest) -> (Int, Data))?>(nil)
+    static var handler: (@Sendable (URLRequest) -> (Int, Data))? {
+        get { handlerState.withLock { $0 } }
+        set { handlerState.withLock { $0 = newValue } }
+    }
+    private let responseLock = NSRecursiveLock()
+    private var isStopped = false
 
     static func bodyData(for request: URLRequest) -> Data {
         if let body = request.httpBody { return body }
@@ -1899,14 +2474,33 @@ private final class MockURLProtocol: URLProtocol, @unchecked Sendable {
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
-        let (status, data) = Self.handler?(request) ?? (500, Data())
-        let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!
-        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: data)
-        client?.urlProtocolDidFinishLoading(self)
+        let request = request
+        let handler = Self.handler
+        // A synchronous gated handler blocks URLSession's protocol callback queue and can
+        // prevent a second in-flight request from starting. Keep the mock requests concurrent.
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            let (status, data) = handler?(request) ?? (500, Data())
+            let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil,
+                                           headerFields: ["Content-Type": "application/json"])!
+            guard sendIfActive({ $0.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed) }) else { return }
+            guard sendIfActive({ $0.urlProtocol(self, didLoad: data) }) else { return }
+            _ = sendIfActive { $0.urlProtocolDidFinishLoading(self) }
+        }
     }
 
-    override func stopLoading() {}
+    override func stopLoading() {
+        responseLock.lock()
+        isStopped = true
+        responseLock.unlock()
+    }
+
+    private func sendIfActive(_ send: (any URLProtocolClient) -> Void) -> Bool {
+        responseLock.lock()
+        defer { responseLock.unlock() }
+        guard !isStopped, let client else { return false }
+        send(client)
+        return !isStopped
+    }
 }
 
 private final class LockedCounter: @unchecked Sendable {

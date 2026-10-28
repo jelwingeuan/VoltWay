@@ -398,6 +398,10 @@ struct ChargingStation: Codable, Equatable, Hashable, Identifiable, Sendable {
     var sourceAttributions: [String]? = nil
     var sourceUpdatedAt: Date? = nil
 
+    var isPrivateSite: Bool {
+        id.hasPrefix("private:") || source == .ownerProvided || access == .privateAccess
+    }
+
     var attributionText: String? { sourceAttributions?.joined(separator: " · ") ?? sourceAttribution ?? source?.attribution }
 
     var networkName: String {
@@ -553,8 +557,7 @@ struct FavoriteStation: Codable, Equatable, Identifiable, Sendable {
     }
 
     private static func safeSnapshot(_ snapshot: ChargingStation?, stationID: String) -> ChargingStation? {
-        guard !stationID.hasPrefix("private:"), snapshot?.source != .ownerProvided,
-              snapshot?.id.hasPrefix("private:") != true else { return nil }
+        guard !stationID.hasPrefix("private:"), snapshot?.isPrivateSite != true else { return nil }
         return snapshot
     }
 }
@@ -750,8 +753,10 @@ struct CarPlaySnapshot: Codable, Equatable, Sendable {
     let savedAt: Date
     let isDemo: Bool
 
+    private static func canCache(_ station: ChargingStation) -> Bool { !station.isPrivateSite }
+
     init(stations: [ChargingStation], favoriteStationIDs: Set<String>, savedAt: Date, isDemo: Bool = false) {
-        let carPlayStations = stations.filter { $0.source != .ownerProvided }
+        let carPlayStations = stations.filter(Self.canCache)
         self.stations = carPlayStations
         self.favoriteStationIDs = favoriteStationIDs.intersection(Set(carPlayStations.map(\.id)))
         self.savedAt = savedAt
@@ -765,7 +770,7 @@ struct CarPlaySnapshot: Codable, Equatable, Sendable {
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         let carPlayStations = try values.decode([ChargingStation].self, forKey: .stations)
-            .filter { $0.source != .ownerProvided }
+            .filter(Self.canCache)
         stations = carPlayStations
         favoriteStationIDs = try values.decode(Set<String>.self, forKey: .favoriteStationIDs)
             .intersection(Set(carPlayStations.map(\.id)))

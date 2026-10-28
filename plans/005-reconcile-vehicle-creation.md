@@ -2,7 +2,7 @@
 
 > **Executor instructions**: Read the current code after plans 001 and 004, then follow the steps and gates. Update `plans/README.md`. Do not add a new Supabase RPC as an unreviewed shortcut.
 >
-> **Drift check (run first)**: `git diff --stat 093cd1d -- VoltWay/AppStore.swift VoltWay/Views.swift VoltWayTests/VoltWayTests.swift && git status --short`
+> **Drift check (run first)**: `git diff --stat e169084..HEAD -- VoltWay/AppStore.swift VoltWay/Views.swift VoltWayTests/VoltWayTests.swift && git status --short`
 > Earlier plans may touch these files. Compare the current `saveProfile` and form implementation to the excerpts below; stop on a semantic mismatch.
 
 ## Status
@@ -12,7 +12,7 @@
 - **Risk**: MED — account state after a partially successful pair of writes must reflect the server.
 - **Depends on**: `plans/001-working-ci.md`; execute after `plans/004-serialize-favorite-toggles.md` to reduce overlapping AppStore edits
 - **Category**: correctness
-- **Planned at**: commit `093cd1d`, 2026-10-27
+- **Planned at**: refreshed against commit `e169084`, 2026-10-28
 
 ## Why this matters
 
@@ -20,10 +20,11 @@ Creating a vehicle performs two separate Supabase writes: save the profile and s
 
 ## Current state
 
-- `VoltWay/AppStore.swift:328-373` builds `updated` with `id: previous?.id ?? UUID()`; for `createsNew`, `previous` is always nil. It calls `backend.saveProfile` then `backend.setActiveVehicle`, and only updates `vehicles` after both succeed. Its catch path only shows an error.
+- `VoltWay/AppStore.swift:343-373` builds `updated` with `id: previous?.id ?? UUID()`; for `createsNew`, `previous` is always nil. It calls `backend.saveProfile` then `backend.setActiveVehicle`, and only updates `vehicles` after both succeed. Its catch path only shows an error. There is no account-revision check between those writes.
 - `VoltWay/Services.swift:206-226` upserts a vehicle by `id` and separately upserts `user_preferences` by `user_id`; these are not one database transaction from the app.
-- `VoltWay/Views.swift:2457-2471` keeps the form open on failure but passes `vehicle?.id` (nil for a new vehicle) on every Save tap.
-- `VoltWayTests/VoltWayTests.swift:1388-1423` checks rollback when the **first** write fails; `:934-973` checks switching existing vehicles. Follow their `MockURLProtocol` and Swift Testing pattern.
+- `VoltWay/Views.swift:2471-2485` keeps the form open on failure but passes `vehicle?.id` (nil for a new vehicle) on every Save tap. An edit sheet can retain an ID after that vehicle is removed from the local list.
+- `VoltWay/AppStore.swift:524-528` treats `profiles.first` as active even when the server preference is nil or names an absent profile. The migration permits a null preference; this fallback must not turn a failed selection into a confirmed one after restart.
+- `VoltWayTests/VoltWayTests.swift:1817-1851` checks rollback when the **first** write fails; `:1017-1055` checks switching existing vehicles. Follow their `MockURLProtocol.bodyData(for:)` and Swift Testing pattern.
 - `supabase/migrations/202609280002_multiple_vehicles.sql:9-27` keeps the active ID in a separate owner-scoped preference row. No schema change is required for idempotent retries.
 
 ## Commands you will need
@@ -51,11 +52,15 @@ Creating a vehicle performs two separate Supabase writes: save the profile and s
 
 Mock a successful profile POST, a failing active-preference POST, and successful profile/preference GETs. Assert the first call reports failure but the server-created vehicle becomes visible after reconciliation, without falsely changing active selection. Include the **first-vehicle case** where preference GET returns nil: `activeVehicleID` must remain nil, not fall back to the new profile. Retry `saveProfile` with the same form-owned ID and assert the second profile POST uses that UUID and the server has only one vehicle. Add a case where the first POST response is lost after commit: retry must still reuse that UUID. Preserve the existing first-write-failure rollback test. Unit tests can prove store idempotency; the form's repeated use of its `@State` ID needs code inspection because this repo has no UI-test target.
 
+Also cover a stale edit ID (it must not create a different vehicle) and an account switch while the profile POST is blocked (it must not proceed to a preference POST for the old account). Use the existing account-revision test pattern rather than relying on sleeps.
+
 **Verify**: Swift test command → new partial-save/retry cases fail before implementation; existing first-write rollback remains green.
 
 ### Step 2: Keep one ID for the lifetime of a new-vehicle form
 
 In the add-vehicle form, allocate a `@State` UUID once and pass it as `vehicleID` for every Save attempt. In `VoltWayStore.saveProfile`, use that provided ID for `createsNew` instead of generating a new UUID on every call. Existing edits must keep their current profile ID. Do not persist the pending ID separately.
+
+If an edit supplies an ID that is no longer in the current account's `vehicles`, reject it with a refresh/retry message instead of allocating a new ID. Check the captured account revision and user after the profile POST, before sending the active-preference POST.
 
 **Verify**: Swift test command → retry UUID assertion passes; existing edit tests pass. `rg -n 'pending.*ID|vehicleID:' VoltWay/Views.swift` → the same form-owned ID is passed at every Save attempt.
 
@@ -72,12 +77,15 @@ Track whether the profile upsert completed. If active-preference saving then fai
 - Retry after second-write failure: same UUID, no duplicate profile.
 - First write commits but response is lost: retry remains idempotent.
 - Account switches during reconciliation: stale result cannot repopulate the new account.
+- Account switches before the second write: no obsolete active-preference POST is sent.
+- A stale edit ID never becomes a newly generated vehicle row.
 
 ## Done criteria
 
 - [ ] A new-vehicle form uses one UUID for all retries.
 - [ ] Partial success is reconciled or explicitly marked as needing account-data retry; no silent orphan/duplicate.
 - [ ] Active selection is never claimed when its write was not confirmed, including after restart with nil preference.
+- [ ] A stale edit does not create a different vehicle; a stale account does not send the second write.
 - [ ] Full Swift and Node suites plus `git diff --check` pass.
 - [ ] No files outside scope changed.
 
