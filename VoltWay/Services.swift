@@ -65,14 +65,17 @@ actor BackendClient {
     private let decoder: JSONDecoder
     private let encoder: JSONEncoder
     private let credentialAccount: String
+    private let credentialStore: any SessionCredentialStore
     private var currentSession: UserSession?
     private var refreshTask: Task<UserSession, any Error>?
     private var authRevision = 0
 
-    init(configuration: AppConfiguration = .current, urlSession: URLSession = .shared, credentialAccount: String = "supabase-session") {
+    init(configuration: AppConfiguration = .current, urlSession: URLSession = .shared,
+         credentialAccount: String = "supabase-session", credentialStore: any SessionCredentialStore = KeychainStore()) {
         self.configuration = configuration
         self.urlSession = urlSession
         self.credentialAccount = credentialAccount
+        self.credentialStore = credentialStore
 
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .custom { decoder in
@@ -94,7 +97,7 @@ actor BackendClient {
     var isConfigured: Bool { configuration.isConfigured }
 
     func restoreSession() throws -> UserSession? {
-        guard let data = try KeychainStore.read(account: credentialAccount) else {
+        guard let data = try credentialStore.read(account: credentialAccount) else {
             currentSession = nil
             return nil
         }
@@ -144,7 +147,7 @@ actor BackendClient {
         authRevision += 1
         currentSession = nil
         refreshTask = nil
-        try KeychainStore.delete(account: credentialAccount)
+        try credentialStore.delete(account: credentialAccount)
     }
 
     func stations(profile: VehicleProfile, session: UserSession?) async throws -> StationFetchResult {
@@ -273,7 +276,7 @@ actor BackendClient {
     }
 
     private func save(_ session: UserSession) throws {
-        try KeychainStore.save(encoder.encode(session), account: credentialAccount)
+        try credentialStore.save(encoder.encode(session), account: credentialAccount)
         currentSession = session
     }
 
@@ -389,7 +392,7 @@ actor BackendClient {
             if case let BackendError.server(status, _) = error,
                status == 400 || status == 401,
                self.currentSession == original {
-                try? KeychainStore.delete(account: credentialAccount)
+                try? credentialStore.delete(account: credentialAccount)
                 self.currentSession = nil
                 throw BackendError.missingSession
             }
@@ -460,14 +463,20 @@ private struct ErrorEnvelope: Decodable {
     var displayMessage: String { message ?? errorDescription ?? error ?? "The request failed." }
 }
 
-private enum KeychainStore {
+protocol SessionCredentialStore: Sendable {
+    func save(_ data: Data, account: String) throws
+    func read(account: String) throws -> Data?
+    func delete(account: String) throws
+}
+
+struct KeychainStore: SessionCredentialStore {
     private static let service = "com.jelwingeuan.VoltWay"
 
-    static func save(_ data: Data, account: String) throws {
+    func save(_ data: Data, account: String) throws {
         try delete(account: account)
         let query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
-            kSecAttrService: service,
+            kSecAttrService: Self.service,
             kSecAttrAccount: account,
             kSecAttrAccessible: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
             kSecValueData: data
@@ -478,10 +487,10 @@ private enum KeychainStore {
         }
     }
 
-    static func read(account: String) throws -> Data? {
+    func read(account: String) throws -> Data? {
         let query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
-            kSecAttrService: service,
+            kSecAttrService: Self.service,
             kSecAttrAccount: account,
             kSecReturnData: true,
             kSecMatchLimit: kSecMatchLimitOne
@@ -495,10 +504,10 @@ private enum KeychainStore {
         return data
     }
 
-    static func delete(account: String) throws {
+    func delete(account: String) throws {
         let query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
-            kSecAttrService: service,
+            kSecAttrService: Self.service,
             kSecAttrAccount: account
         ]
         let status = SecItemDelete(query as CFDictionary)

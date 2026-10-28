@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import Testing
 @testable import VoltWay
 
@@ -832,6 +833,21 @@ struct BackendClientTests {
         await store.signOut()
     }
 
+    @Test("Injected session storage supports sign-in, restore, and sign-out without Keychain")
+    func injectedSessionStorage() async throws {
+        MockURLProtocol.handler = { request in
+            #expect(request.url?.path == "/auth/v1/token")
+            return (200, Data(#"{"access_token":"fresh","refresh_token":"refresh-1","user":{"id":"user-1","email":"driver@example.com"}}"#.utf8))
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let client = makeClient(account: "test-\(UUID().uuidString)")
+        let signedIn = try await client.signIn(email: "driver@example.com", password: "password-123")
+        #expect(try await client.restoreSession() == signedIn)
+        try await client.signOut()
+        #expect(try await client.restoreSession() == nil)
+    }
+
     @Test("Station responses preserve partial-source warnings and fractional sync timestamps")
     @MainActor func partialCoverageMetadata() async throws {
         MockURLProtocol.handler = { request in
@@ -1550,7 +1566,24 @@ struct BackendClientTests {
     private func makeClient(account: String) -> BackendClient {
         let sessionConfiguration = URLSessionConfiguration.ephemeral
         sessionConfiguration.protocolClasses = [MockURLProtocol.self]
-        return BackendClient(configuration: configuration, urlSession: URLSession(configuration: sessionConfiguration), credentialAccount: account)
+        return BackendClient(configuration: configuration, urlSession: URLSession(configuration: sessionConfiguration),
+                             credentialAccount: account, credentialStore: InMemoryCredentialStore())
+    }
+}
+
+private final class InMemoryCredentialStore: SessionCredentialStore {
+    private let stored = Mutex<[String: Data]>([:])
+
+    func read(account: String) throws -> Data? {
+        stored.withLock { $0[account] }
+    }
+
+    func save(_ data: Data, account: String) throws {
+        stored.withLock { $0[account] = data }
+    }
+
+    func delete(account: String) throws {
+        stored.withLock { _ = $0.removeValue(forKey: account) }
     }
 }
 
