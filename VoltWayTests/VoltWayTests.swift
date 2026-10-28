@@ -1147,6 +1147,7 @@ struct BackendClientTests {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         let profiles = try encoder.encode([profile])
+        let preference = try encoder.encode([ActiveVehiclePreference(userID: "user-1", activeVehicleID: profile.id)])
         let stations = Data(#"{"stations": "#.utf8) + (try encoder.encode([unknown, available])) + Data("}".utf8)
         let stationRequests = LockedCounter()
         MockURLProtocol.handler = { request in
@@ -1155,6 +1156,8 @@ struct BackendClientTests {
                 return (200, Data(#"{"access_token":"fresh","refresh_token":"refresh-1","user":{"id":"user-1","email":"driver@example.com"}}"#.utf8))
             case "/rest/v1/vehicle_profiles":
                 return (200, profiles)
+            case "/rest/v1/user_preferences":
+                return (200, preference)
             case "/functions/v1/stations":
                 stationRequests.increment()
                 return (200, stations)
@@ -1199,6 +1202,7 @@ struct BackendClientTests {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         let profiles = try encoder.encode([profile])
+        let preference = try encoder.encode([ActiveVehiclePreference(userID: "user-1", activeVehicleID: profile.id)])
         let stations = Data(#"{"stations": "#.utf8) + (try encoder.encode([futureAvailable, unknown])) + Data("}".utf8)
         let stationRequests = LockedCounter()
         MockURLProtocol.handler = { request in
@@ -1207,6 +1211,8 @@ struct BackendClientTests {
                 return (200, Data(#"{"access_token":"fresh","refresh_token":"refresh-1","user":{"id":"user-1","email":"driver@example.com"}}"#.utf8))
             case "/rest/v1/vehicle_profiles":
                 return (200, profiles)
+            case "/rest/v1/user_preferences":
+                return (200, preference)
             case "/functions/v1/stations":
                 stationRequests.increment()
                 return (200, stations)
@@ -1262,6 +1268,7 @@ struct BackendClientTests {
         let encoder = JSONEncoder()
         let profile = VehicleProfile(userID: "user-1", name: "City EV", connectors: [.type2], minimumPowerKW: nil)
         let profileResponse = try encoder.encode([profile])
+        let preferenceResponse = try encoder.encode([ActiveVehiclePreference(userID: "user-1", activeVehicleID: profile.id)])
         let visibleStations = Data(#"{"stations":"#.utf8) + (try encoder.encode([privateStation])) + Data("}".utf8)
         let stationRequests = LockedCounter()
         MockURLProtocol.handler = { request in
@@ -1274,6 +1281,8 @@ struct BackendClientTests {
                 return (204, Data())
             case ("/rest/v1/vehicle_profiles", "GET"):
                 return (200, profileResponse)
+            case ("/rest/v1/user_preferences", "GET"):
+                return (200, preferenceResponse)
             case ("/functions/v1/stations", _):
                 stationRequests.increment()
                 return (200, stationRequests.value == 1 ? visibleStations : Data(#"{"stations":[]}"#.utf8))
@@ -1391,6 +1400,7 @@ struct BackendClientTests {
         let favoriteResponse = try encoder.encode(favorites)
         let remainingFavoriteResponse = try encoder.encode([favorites[1]])
         let profileResponse = try encoder.encode([profile])
+        let preferenceResponse = try encoder.encode([ActiveVehiclePreference(userID: "user-1", activeVehicleID: profile.id)])
         let stationResponse = Data(#"{"stations":"#.utf8) + (try encoder.encode([current])) + Data("}".utf8)
         let deleteRequests = LockedCounter()
         let firstDeletedURL = LockedURL()
@@ -1400,6 +1410,8 @@ struct BackendClientTests {
                 return (200, Data(#"{"access_token":"fresh","refresh_token":"refresh-1","user":{"id":"user-1","email":"driver@example.com"}}"#.utf8))
             case ("/rest/v1/vehicle_profiles", "GET"):
                 return (200, profileResponse)
+            case ("/rest/v1/user_preferences", "GET"):
+                return (200, preferenceResponse)
             case ("/rest/v1/favorite_stations", "GET"):
                 guard deleteRequests.value >= 2 else { return (200, favoriteResponse) }
                 switch scenario {
