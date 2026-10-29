@@ -2142,6 +2142,150 @@ struct BackendClientTests {
         await restoredStore.signOut()
     }
 
+    @Test("Deleting the active vehicle selects the next one only after the server confirms it")
+    @MainActor func deleteActiveVehicleSelectsNext() async throws {
+        let first = VehicleProfile(id: UUID(uuidString: "00000000-0000-0000-0000-000000000071")!, userID: "user-1",
+                                   name: "City EV", connectors: [.type2], minimumPowerKW: nil)
+        let second = VehicleProfile(id: UUID(uuidString: "00000000-0000-0000-0000-000000000072")!, userID: "user-1",
+                                    name: "Road EV", connectors: [.ccs2], minimumPowerKW: nil)
+        let server = VehicleMockServer(profiles: [first, second], activeVehicleID: first.id)
+        MockURLProtocol.handler = { server.respond(to: $0) }
+        defer { MockURLProtocol.handler = nil }
+
+        let store = VoltWayStore(configuration: configuration, backend: makeClient(account: "test-\(UUID().uuidString)"))
+        await store.signIn(email: "driver@example.com", password: "password-123")
+        await store.deleteVehicle(first)
+
+        let state = server.snapshot
+        #expect(state.profiles.map(\.id) == [second.id])
+        #expect(state.activeVehicleID == second.id)
+        #expect(state.deleteRequestIDs == [first.id])
+        #expect(state.preferencePostIDs == [second.id])
+        #expect(state.stationRequests == 1)
+        #expect(store.vehicles.map(\.id) == [second.id])
+        #expect(store.activeVehicleID == second.id)
+        #expect(store.profile == second)
+        #expect(store.errorMessage == nil)
+        await store.signOut()
+    }
+
+    @Test("A failed preference write after deletion leaves no falsely selected vehicle")
+    @MainActor func deletedVehiclePreferenceFailureReconciles() async throws {
+        let first = VehicleProfile(id: UUID(uuidString: "00000000-0000-0000-0000-000000000073")!, userID: "user-1",
+                                   name: "City EV", connectors: [.type2], minimumPowerKW: nil)
+        let second = VehicleProfile(id: UUID(uuidString: "00000000-0000-0000-0000-000000000074")!, userID: "user-1",
+                                    name: "Road EV", connectors: [.ccs2], minimumPowerKW: nil)
+        let server = VehicleMockServer(profiles: [first, second], activeVehicleID: first.id,
+                                       failingPreferenceResponses: 1)
+        MockURLProtocol.handler = { server.respond(to: $0) }
+        defer { MockURLProtocol.handler = nil }
+
+        let store = VoltWayStore(configuration: configuration, backend: makeClient(account: "test-\(UUID().uuidString)"))
+        await store.signIn(email: "driver@example.com", password: "password-123")
+        await store.deleteVehicle(first)
+
+        let state = server.snapshot
+        #expect(state.profiles.map(\.id) == [second.id])
+        #expect(state.activeVehicleID == nil, "The database clears a deleted active ID")
+        #expect(state.preferencePostIDs == [second.id])
+        #expect(state.stationRequests == 1, "Reconciliation must not reload the charger catalog")
+        #expect(store.vehicles.map(\.id) == [second.id])
+        #expect(store.activeVehicleID == nil)
+        #expect(store.profile.connectors.isEmpty)
+        #expect(store.accountDataNeedsRetry == false)
+        #expect(store.errorMessage == "Vehicle deleted, but no active vehicle is selected. Select a vehicle to continue.")
+        await store.signOut()
+    }
+
+    @Test("A lost DELETE response is reconciled from the committed server state")
+    @MainActor func committedVehicleDeleteResponseLost() async throws {
+        let first = VehicleProfile(id: UUID(uuidString: "00000000-0000-0000-0000-000000000075")!, userID: "user-1",
+                                   name: "City EV", connectors: [.type2], minimumPowerKW: nil)
+        let second = VehicleProfile(id: UUID(uuidString: "00000000-0000-0000-0000-000000000076")!, userID: "user-1",
+                                    name: "Road EV", connectors: [.ccs2], minimumPowerKW: nil)
+        let server = VehicleMockServer(profiles: [first, second], activeVehicleID: first.id,
+                                       failingDeleteResponses: 1)
+        MockURLProtocol.handler = { server.respond(to: $0) }
+        defer { MockURLProtocol.handler = nil }
+
+        let store = VoltWayStore(configuration: configuration, backend: makeClient(account: "test-\(UUID().uuidString)"))
+        await store.signIn(email: "driver@example.com", password: "password-123")
+        await store.deleteVehicle(first)
+
+        let state = server.snapshot
+        #expect(state.profiles.map(\.id) == [second.id])
+        #expect(state.activeVehicleID == nil)
+        #expect(state.deleteRequestIDs == [first.id])
+        #expect(state.preferencePostIDs.isEmpty, "An uncertain DELETE must not start a second write")
+        #expect(state.stationRequests == 1)
+        #expect(store.vehicles.map(\.id) == [second.id])
+        #expect(store.activeVehicleID == nil)
+        #expect(store.profile.connectors.isEmpty)
+        #expect(store.accountDataNeedsRetry == false)
+        #expect(store.errorMessage == "Vehicle deleted, but no active vehicle is selected. Select a vehicle to continue.")
+        await store.signOut()
+    }
+
+    @Test("An uncommitted DELETE failure keeps the server-confirmed vehicle active")
+    @MainActor func rejectedVehicleDeleteKeepsSelection() async throws {
+        let first = VehicleProfile(id: UUID(uuidString: "00000000-0000-0000-0000-000000000077")!, userID: "user-1",
+                                   name: "City EV", connectors: [.type2], minimumPowerKW: nil)
+        let second = VehicleProfile(id: UUID(uuidString: "00000000-0000-0000-0000-000000000078")!, userID: "user-1",
+                                    name: "Road EV", connectors: [.ccs2], minimumPowerKW: nil)
+        let server = VehicleMockServer(profiles: [first, second], activeVehicleID: first.id,
+                                       rejectingDeleteRequests: 1)
+        MockURLProtocol.handler = { server.respond(to: $0) }
+        defer { MockURLProtocol.handler = nil }
+
+        let store = VoltWayStore(configuration: configuration, backend: makeClient(account: "test-\(UUID().uuidString)"))
+        await store.signIn(email: "driver@example.com", password: "password-123")
+        await store.deleteVehicle(first)
+
+        let state = server.snapshot
+        #expect(state.profiles.map(\.id) == [first.id, second.id])
+        #expect(state.activeVehicleID == first.id)
+        #expect(state.preferencePostIDs.isEmpty)
+        #expect(store.vehicles.map(\.id) == [first.id, second.id])
+        #expect(store.activeVehicleID == first.id)
+        #expect(store.profile == first)
+        #expect(store.accountDataNeedsRetry == false)
+        #expect(store.errorMessage == "Delete rejected")
+        await store.signOut()
+    }
+
+    @Test("Failed deletion reconciliation requires retry and hides an unverified active vehicle")
+    @MainActor func failedVehicleDeleteReconciliationNeedsRetry() async throws {
+        let first = VehicleProfile(id: UUID(uuidString: "00000000-0000-0000-0000-000000000079")!, userID: "user-1",
+                                   name: "City EV", connectors: [.type2], minimumPowerKW: nil)
+        let second = VehicleProfile(id: UUID(uuidString: "00000000-0000-0000-0000-000000000080")!, userID: "user-1",
+                                    name: "Road EV", connectors: [.ccs2], minimumPowerKW: nil)
+        let charger = DemoData.stations[0]
+        let server = VehicleMockServer(profiles: [first, second], activeVehicleID: first.id,
+                                       stations: [charger], failingPreferenceResponses: 1,
+                                       failingReconciliationReads: 1)
+        MockURLProtocol.handler = { server.respond(to: $0) }
+        defer { MockURLProtocol.handler = nil }
+
+        let store = VoltWayStore(configuration: configuration, backend: makeClient(account: "test-\(UUID().uuidString)"))
+        await store.signIn(email: "driver@example.com", password: "password-123")
+        #expect(store.activeVehicleID == first.id)
+        #expect(CarPlaySnapshotStore.load().stations.map(\.id) == [charger.id])
+        await store.deleteVehicle(first)
+
+        #expect(server.snapshot.profiles.map(\.id) == [second.id])
+        #expect(server.snapshot.activeVehicleID == nil)
+        #expect(store.activeVehicleID == nil)
+        #expect(store.profile.connectors.isEmpty)
+        #expect(CarPlaySnapshotStore.load().stations.isEmpty)
+        #expect(store.accountDataNeedsRetry)
+        #expect(store.errorMessage == "Vehicle deletion could not be verified. Retry account sync before continuing.")
+        await store.retryAccountData()
+        #expect(store.vehicles.map(\.id) == [second.id])
+        #expect(store.activeVehicleID == nil)
+        #expect(store.accountDataNeedsRetry == false)
+        await store.signOut()
+    }
+
     @Test("A lost profile-save response can be retried without creating another vehicle")
     @MainActor func lostProfileResponseRetryUsesStableID() async throws {
         let vehicleID = UUID(uuidString: "00000000-0000-0000-0000-000000000055")!
@@ -2351,11 +2495,15 @@ private final class InMemoryCredentialStore: SessionCredentialStore {
 private struct VehicleMockState: Sendable {
     var profiles: [VehicleProfile]
     var activeVehicleID: UUID?
+    var stations: [ChargingStation]
     var profilePostIDs: [UUID] = []
     var preferencePostIDs: [UUID?] = []
+    var deleteRequestIDs: [UUID] = []
     var stationRequests = 0
     var failingProfileResponses: Int
     var failingPreferenceResponses: Int
+    var failingDeleteResponses: Int
+    var rejectingDeleteRequests: Int
     var committingPreferenceResponseFailures: Int
     var failingReconciliationReads: Int
     var failingFavoriteReads: Int
@@ -2364,13 +2512,17 @@ private struct VehicleMockState: Sendable {
 private final class VehicleMockServer: Sendable {
     private let state: Mutex<VehicleMockState>
 
-    init(profiles: [VehicleProfile] = [], activeVehicleID: UUID? = nil,
+    init(profiles: [VehicleProfile] = [], activeVehicleID: UUID? = nil, stations: [ChargingStation] = [],
          failingProfileResponses: Int = 0, failingPreferenceResponses: Int = 0,
-         committingPreferenceResponseFailures: Int = 0, failingReconciliationReads: Int = 0,
+         failingDeleteResponses: Int = 0, rejectingDeleteRequests: Int = 0,
+         committingPreferenceResponseFailures: Int = 0,
+         failingReconciliationReads: Int = 0,
          failingFavoriteReads: Int = 0) {
-        state = Mutex(VehicleMockState(profiles: profiles, activeVehicleID: activeVehicleID,
+        state = Mutex(VehicleMockState(profiles: profiles, activeVehicleID: activeVehicleID, stations: stations,
                                        failingProfileResponses: failingProfileResponses,
                                        failingPreferenceResponses: failingPreferenceResponses,
+                                       failingDeleteResponses: failingDeleteResponses,
+                                       rejectingDeleteRequests: rejectingDeleteRequests,
                                        committingPreferenceResponseFailures: committingPreferenceResponseFailures,
                                        failingReconciliationReads: failingReconciliationReads,
                                        failingFavoriteReads: failingFavoriteReads))
@@ -2385,7 +2537,8 @@ private final class VehicleMockServer: Sendable {
             return (200, Data(#"{"access_token":"fresh","refresh_token":"refresh-1","user":{"id":"user-1","email":"driver@example.com"}}"#.utf8))
         case ("/rest/v1/vehicle_profiles", "GET"):
             let profiles = state.withLock { state -> [VehicleProfile]? in
-                if !state.profilePostIDs.isEmpty && state.failingReconciliationReads > 0 {
+                if (!state.profilePostIDs.isEmpty || !state.deleteRequestIDs.isEmpty)
+                    && state.failingReconciliationReads > 0 {
                     state.failingReconciliationReads -= 1
                     return nil
                 }
@@ -2413,6 +2566,29 @@ private final class VehicleMockServer: Sendable {
                 return false
             }
             return fails ? (503, Data(#"{"message":"Profile response lost"}"#.utf8)) : (204, Data())
+        case ("/rest/v1/vehicle_profiles", "DELETE"):
+            guard let url = request.url,
+                  let idFilter = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                    .queryItems?.first(where: { $0.name == "id" })?.value,
+                  idFilter.hasPrefix("eq."),
+                  let id = UUID(uuidString: String(idFilter.dropFirst(3))) else {
+                return (422, Data(#"{"message":"Invalid vehicle ID"}"#.utf8))
+            }
+            let result = state.withLock { state -> (Int, Data) in
+                state.deleteRequestIDs.append(id)
+                if state.rejectingDeleteRequests > 0 {
+                    state.rejectingDeleteRequests -= 1
+                    return (503, Data(#"{"message":"Delete rejected"}"#.utf8))
+                }
+                state.profiles.removeAll { $0.id == id }
+                if state.activeVehicleID == id { state.activeVehicleID = nil }
+                if state.failingDeleteResponses > 0 {
+                    state.failingDeleteResponses -= 1
+                    return (503, Data(#"{"message":"Delete response lost"}"#.utf8))
+                }
+                return (204, Data())
+            }
+            return result
         case ("/rest/v1/user_preferences", "GET"):
             let activeID = state.withLock { $0.activeVehicleID }
             let preference = ActiveVehiclePreference(userID: "user-1", activeVehicleID: activeID)
@@ -2448,8 +2624,14 @@ private final class VehicleMockServer: Sendable {
             if fails { return (503, Data(#"{"message":"Favorites unavailable"}"#.utf8)) }
             return (200, Data("[]".utf8))
         case ("/functions/v1/stations", "GET"):
-            state.withLock { $0.stationRequests += 1 }
-            return (200, Data(#"{"stations":[]}"#.utf8))
+            let stations = state.withLock { state in
+                state.stationRequests += 1
+                return state.stations
+            }
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .iso8601
+            guard let data = try? encoder.encode(stations) else { return (500, Data()) }
+            return (200, Data(#"{"stations":"#.utf8) + data + Data("}".utf8))
         default:
             return (404, Data(#"{"message":"Unexpected vehicle test request"}"#.utf8))
         }

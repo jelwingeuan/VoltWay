@@ -464,21 +464,92 @@ final class VoltWayStore {
         guard vehicles.contains(where: { $0.id == vehicle.id }) else { return }
         let accountRevision = accountRevision
         let userID = session?.userID
-        do {
-            if let session { try await backend.deleteProfile(vehicle.id, session: session) }
-            guard isCurrentAccount(accountRevision, userID: userID) else { return }
+        guard let session else {
             vehicles.removeAll { $0.id == vehicle.id }
-            let deletedActiveVehicle = activeVehicleID == vehicle.id
-            if deletedActiveVehicle {
+            if activeVehicleID == vehicle.id {
                 let next = vehicles.first
                 activeVehicleID = next?.id
-                profile = next ?? VehicleProfile(userID: session?.userID, connectors: [], minimumPowerKW: nil)
+                profile = next ?? VehicleProfile(connectors: [], minimumPowerKW: nil)
                 rebuildCompatibleStations()
             }
             persistCarPlaySnapshot()
-            if deletedActiveVehicle, let session { try await backend.setActiveVehicle(activeVehicleID, session: session) }
+            return
+        }
+
+        do {
+            try await backend.deleteProfile(vehicle.id, session: session)
         } catch {
-            if isCurrentAccount(accountRevision, userID: userID) { show(error) }
+            guard isCurrentAccount(accountRevision, userID: userID) else { return }
+            // A failed response cannot tell us whether the DELETE committed.
+            await reconcileVehicleDeletion(vehicle.id, expectedActiveID: nil, session: session,
+                                           revision: accountRevision, deletionError: error)
+            return
+        }
+        guard isCurrentAccount(accountRevision, userID: userID) else { return }
+
+        let deletedActiveVehicle = activeVehicleID == vehicle.id
+        let next = deletedActiveVehicle ? vehicles.first(where: { $0.id != vehicle.id }) : nil
+        vehicles.removeAll { $0.id == vehicle.id }
+        if deletedActiveVehicle {
+            activeVehicleID = nil
+            profile = VehicleProfile(userID: userID, connectors: [], minimumPowerKW: nil)
+            rebuildCompatibleStations()
+        }
+        persistCarPlaySnapshot()
+        if deletedActiveVehicle {
+            do {
+                try await backend.setActiveVehicle(next?.id, session: session)
+            } catch {
+                guard isCurrentAccount(accountRevision, userID: userID) else { return }
+                await reconcileVehicleDeletion(vehicle.id, expectedActiveID: next?.id, session: session,
+                                               revision: accountRevision, deletionError: nil)
+                return
+            }
+        }
+        guard isCurrentAccount(accountRevision, userID: userID) else { return }
+        if deletedActiveVehicle {
+            activeVehicleID = next?.id
+            profile = next ?? VehicleProfile(userID: userID, connectors: [], minimumPowerKW: nil)
+            rebuildCompatibleStations()
+            persistCarPlaySnapshot()
+        }
+        errorMessage = nil
+    }
+
+    private func reconcileVehicleDeletion(_ deletedID: UUID, expectedActiveID: UUID?, session: UserSession,
+                                          revision: Int, deletionError: (any Error)?) async {
+        do {
+            let profiles = try await backend.loadProfiles(session: session)
+            guard isCurrentAccount(revision, userID: session.userID) else { return }
+            let selectedID = try await backend.loadActiveVehicleID(session: session)
+            guard isCurrentAccount(revision, userID: session.userID) else { return }
+            applyVehicleSelection(profiles: profiles, selectedID: selectedID, userID: session.userID)
+            persistCarPlaySnapshot()
+            if profiles.contains(where: { $0.id == deletedID }) {
+                if let deletionError { show(deletionError) }
+                else { errorMessage = "Vehicle deletion could not be verified. Retry account sync before continuing." }
+            } else if !profiles.isEmpty && selectedID == nil {
+                errorMessage = "Vehicle deleted, but no active vehicle is selected. Select a vehicle to continue."
+            } else if deletionError != nil {
+                errorMessage = nil
+                noticeMessage = "Vehicle deletion was confirmed after reloading."
+            } else if selectedID == expectedActiveID {
+                errorMessage = nil
+                noticeMessage = "Vehicle deleted. Active selection was confirmed after reloading."
+            } else {
+                errorMessage = "Vehicle deleted, but active selection changed. Check your selected vehicle."
+            }
+        } catch {
+            guard isCurrentAccount(revision, userID: session.userID) else { return }
+            requireAccountRetry(.accountData)
+            // Until the server can be read, do not present a possibly deleted vehicle as active.
+            if activeVehicleID == deletedID {
+                activeVehicleID = nil
+                profile = VehicleProfile(userID: session.userID, connectors: [], minimumPowerKW: nil)
+                rebuildCompatibleStations()
+                persistCarPlaySnapshot()
+            }
+            errorMessage = "Vehicle deletion could not be verified. Retry account sync before continuing."
         }
     }
 

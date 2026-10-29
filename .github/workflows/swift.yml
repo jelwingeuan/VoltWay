@@ -32,7 +32,7 @@ jobs:
       run: |
         set -o pipefail
         supabase test db supabase/tests/private_favorite_storage.sql --local 2>&1 | tee "$RUNNER_TEMP/voltway-pgtap.txt"
-        grep -Eq 'Files=1,[[:space:]]*Tests=42' "$RUNNER_TEMP/voltway-pgtap.txt"
+        grep -Eq 'Files=1,[[:space:]]*Tests=50' "$RUNNER_TEMP/voltway-pgtap.txt"
     - name: Test Data API grants
       run: |
         set -o pipefail

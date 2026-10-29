@@ -1,7 +1,7 @@
 begin;
 
 -- These accounts and coordinates are synthetic. The transaction is rolled back by pgTAP.
-select plan(42);
+select plan(50);
 
 insert into auth.users (id, email, aud, role, encrypted_password, email_confirmed_at)
 values
@@ -249,6 +249,68 @@ select is(
   (select invited_email from public.private_charger_site_invites where site_id = '66666666-6666-4666-8666-666666666666'),
   'invited@example.invalid',
   'valid invitation is normalized and retained'
+);
+
+reset role;
+select ok(
+  not has_schema_privilege('anon', 'voltway_private', 'USAGE'),
+  'anonymous callers cannot use the internal invitation schema'
+);
+select ok(
+  not has_function_privilege('anon', 'voltway_private.current_confirmed_email()', 'EXECUTE'),
+  'anonymous callers cannot execute the account-email lookup'
+);
+
+-- Simulate an email change after the token was issued. The old invitation is
+-- still present, but access must follow auth.users rather than the stale JWT.
+insert into public.private_charger_site_invites (site_id, owner_id, invited_email, invited_by)
+values (
+  '44444444-4444-4444-8444-444444444444',
+  '11111111-1111-4111-8111-111111111111',
+  'former-invitee@example.invalid',
+  '11111111-1111-4111-8111-111111111111'
+);
+update auth.users set email = 'invited@example.invalid'
+where id = '22222222-2222-4222-8222-222222222222';
+
+set local role authenticated;
+select set_config('request.jwt.claim.sub', '22222222-2222-4222-8222-222222222222', true);
+select set_config('request.jwt.claims', '{"sub":"22222222-2222-4222-8222-222222222222","email":"former-invitee@example.invalid","role":"authenticated"}', true);
+
+select is(
+  (select count(*)::integer from public.private_charger_sites where id = '44444444-4444-4444-8444-444444444444'),
+  0,
+  'a stale JWT email cannot read a site after the account email changes'
+);
+select is(
+  (select count(*)::integer from public.private_charger_site_invites where site_id = '44444444-4444-4444-8444-444444444444'),
+  0,
+  'a stale JWT email cannot read the old invitation'
+);
+select is(
+  (select count(*)::integer from public.private_charger_sites where id = '66666666-6666-4666-8666-666666666666'),
+  1,
+  'a confirmed current email can read its site before JWT refresh'
+);
+select is(
+  (select count(*)::integer from public.private_charger_site_invites where site_id = '66666666-6666-4666-8666-666666666666'),
+  1,
+  'a confirmed current email can read its invitation before JWT refresh'
+);
+
+reset role;
+update auth.users set email_confirmed_at = null
+where id = '22222222-2222-4222-8222-222222222222';
+set local role authenticated;
+select is(
+  (select count(*)::integer from public.private_charger_sites where id = '66666666-6666-4666-8666-666666666666'),
+  0,
+  'an unconfirmed current email cannot read its invited site'
+);
+select is(
+  (select count(*)::integer from public.private_charger_site_invites where site_id = '66666666-6666-4666-8666-666666666666'),
+  0,
+  'an unconfirmed current email cannot read its invitation'
 );
 
 select * from finish();
