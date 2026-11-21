@@ -769,6 +769,13 @@ struct BackendClientTests {
         case reconciliationUnavailable
     }
 
+    enum FavoriteSaveScenario: CaseIterable, Sendable {
+        case responseLostAfterCommit
+        case aliasConfirmed
+        case notCommitted
+        case reconciliationUnavailable
+    }
+
     private func favoriteStation(id: String = "gentari-favorite") -> ChargingStation {
         ChargingStation(
             id: id, name: "Favorite charger", address: "Kuala Lumpur",
@@ -1473,6 +1480,79 @@ struct BackendClientTests {
         await store.signOut()
     }
 
+    @Test("A failed favorite-save response checks the server before deciding its state", .serialized,
+          arguments: FavoriteSaveScenario.allCases)
+    @MainActor func failedFavoriteSaveReconciles(scenario: FavoriteSaveScenario) async throws {
+        var station = favoriteStation()
+        station.sourceIDs = ["openChargeMap": "42"]
+        let profile = VehicleProfile(userID: "user-1", name: "Daily EV", connectors: [.ccs2], minimumPowerKW: nil)
+        let savedID = scenario == .aliasConfirmed ? "ocm:42" : station.id
+        let saved = FavoriteStation(userID: "user-1", stationID: savedID,
+                                    stationSnapshot: savedID == station.id ? station : nil, createdAt: nil)
+        let encoder = JSONEncoder()
+        let savedResponse = try encoder.encode([saved])
+        let profilesResponse = try encoder.encode([profile])
+        let preferenceResponse = try encoder.encode([ActiveVehiclePreference(userID: "user-1", activeVehicleID: profile.id)])
+        let stationsResponse = Data(#"{"stations":"#.utf8) + (try encoder.encode([station])) + Data("}".utf8)
+        let favoriteReads = LockedCounter()
+        let favoritePosts = LockedCounter()
+        MockURLProtocol.handler = { request in
+            switch (request.url?.path, request.httpMethod) {
+            case ("/auth/v1/token", _):
+                return (200, Data(#"{"access_token":"fresh","refresh_token":"refresh-1","user":{"id":"user-1","email":"driver@example.com"}}"#.utf8))
+            case ("/rest/v1/vehicle_profiles", "GET"):
+                return (200, profilesResponse)
+            case ("/rest/v1/user_preferences", "GET"):
+                return (200, preferenceResponse)
+            case ("/rest/v1/favorite_stations", "GET"):
+                favoriteReads.increment()
+                if favoriteReads.value == 1 { return (200, Data("[]".utf8)) }
+                switch scenario {
+                case .responseLostAfterCommit, .aliasConfirmed: return (200, savedResponse)
+                case .notCommitted: return (200, Data("[]".utf8))
+                case .reconciliationUnavailable: return (503, Data(#"{"message":"Read failed"}"#.utf8))
+                }
+            case ("/rest/v1/favorite_stations", "POST"):
+                favoritePosts.increment()
+                return (503, Data(#"{"message":"Save failed"}"#.utf8))
+            case ("/functions/v1/stations", _):
+                return (200, stationsResponse)
+            default:
+                return (200, Data("[]".utf8))
+            }
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let store = VoltWayStore(configuration: configuration, backend: makeClient(account: "test-\(UUID().uuidString)"))
+        await store.signIn(email: "driver@example.com", password: "password-123")
+        #expect(store.favoriteStationIDs.isEmpty)
+        await store.toggleFavorite(station)
+
+        #expect(favoritePosts.value == 1)
+        #expect(favoriteReads.value == 2)
+        #expect(store.favoriteMutationIDs.isEmpty)
+        switch scenario {
+        case .responseLostAfterCommit, .aliasConfirmed:
+            #expect(store.favorites.map(\.stationID) == [savedID])
+            #expect(store.favoriteStationIDs.contains(station.id))
+            #expect(CarPlaySnapshotStore.load().favoriteStationIDs == [station.id])
+            #expect(store.accountDataNeedsRetry == false)
+            #expect(store.errorMessage == nil)
+            #expect(store.noticeMessage == "Saved charger added; confirmation was interrupted.")
+        case .notCommitted:
+            #expect(store.favoriteStationIDs.contains(station.id) == false)
+            #expect(CarPlaySnapshotStore.load().favoriteStationIDs.isEmpty)
+            #expect(store.accountDataNeedsRetry == false)
+            #expect(store.errorMessage == "Save failed")
+        case .reconciliationUnavailable:
+            #expect(store.favoriteStationIDs.contains(station.id) == false)
+            #expect(CarPlaySnapshotStore.load().favoriteStationIDs.isEmpty)
+            #expect(store.accountDataNeedsRetry)
+            #expect(store.errorMessage == "Saved chargers could not be verified. Reload account data to check them.")
+        }
+        await store.signOut()
+    }
+
     @Test("Rapid save taps keep one favorite request in flight")
     @MainActor func favoriteSaveIsSingleFlight() async throws {
         let station = favoriteStation()
@@ -1733,6 +1813,62 @@ struct BackendClientTests {
         await newTap.value
         #expect(store.favoriteMutationIDs.isEmpty)
         #expect(store.favorites.first?.userID == "user-2")
+        await store.signOut()
+    }
+
+    @Test("A previous account's favorite readback cannot change the newly signed-in account")
+    @MainActor func favoriteSaveReadbackRespectsAccountSwitch() async throws {
+        let station = favoriteStation()
+        let authRequests = LockedCounter()
+        let oldFavoriteReads = LockedCounter()
+        let releaseOldRead = DispatchSemaphore(value: 0)
+        let oldFavorite = FavoriteStation(userID: "user-1", stationID: station.id,
+                                          stationSnapshot: station, createdAt: nil)
+        let oldFavoriteResponse = try JSONEncoder().encode([oldFavorite])
+        MockURLProtocol.handler = { request in
+            let token = request.value(forHTTPHeaderField: "Authorization")
+            switch (request.url?.path, request.httpMethod) {
+            case ("/auth/v1/token", _):
+                authRequests.increment()
+                let user = authRequests.value == 1 ? "user-1" : "user-2"
+                let accessToken = authRequests.value == 1 ? "old-token" : "new-token"
+                return (200, Data(#"{"access_token":"\#(accessToken)","refresh_token":"refresh","user":{"id":"\#(user)","email":"driver@example.com"}}"#.utf8))
+            case ("/rest/v1/favorite_stations", "GET") where token == "Bearer old-token":
+                oldFavoriteReads.increment()
+                if oldFavoriteReads.value > 1 {
+                    _ = releaseOldRead.wait(timeout: .now() + 10)
+                    return (200, oldFavoriteResponse)
+                }
+                return (200, Data("[]".utf8))
+            case ("/rest/v1/favorite_stations", "POST") where token == "Bearer old-token":
+                return (503, Data(#"{"message":"Save failed"}"#.utf8))
+            case ("/functions/v1/stations", _):
+                return (200, Data(#"{"stations":[]}"#.utf8))
+            default:
+                return (200, Data("[]".utf8))
+            }
+        }
+        defer {
+            releaseOldRead.signal()
+            MockURLProtocol.handler = nil
+        }
+
+        let store = VoltWayStore(configuration: configuration, backend: makeClient(account: "test-\(UUID().uuidString)"))
+        await store.signIn(email: "old@example.com", password: "password-123")
+        let oldTap = Task { await store.toggleFavorite(station) }
+        try await waitForRequest(oldFavoriteReads, count: 2)
+        await store.signOut()
+        await store.signIn(email: "new@example.com", password: "password-123")
+        #expect(store.session?.userID == "user-2")
+        #expect(store.favorites.isEmpty)
+
+        releaseOldRead.signal()
+        await oldTap.value
+        #expect(store.session?.userID == "user-2")
+        #expect(store.favorites.isEmpty)
+        #expect(store.favoriteStationIDs.isEmpty)
+        #expect(store.accountDataNeedsRetry == false)
+        #expect(store.errorMessage == nil)
         await store.signOut()
     }
 

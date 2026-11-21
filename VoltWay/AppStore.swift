@@ -607,8 +607,32 @@ final class VoltWayStore {
                     return
                 }
             } else {
-                // A different charger's save may have completed while this request was in flight.
-                favorites.removeAll { $0.stationID == station.id }
+                do {
+                    let confirmedFavorites = try await backend.loadFavorites(session: session)
+                    guard isCurrentAccount(accountRevision, userID: userID) else { return }
+                    let identityIDs = Self.stationIdentityIDs(station)
+                    let confirmedSave = confirmedFavorites.contains { identityIDs.contains($0.stationID) }
+                    // The read may overlap another charger's mutation, so replace only this site's IDs.
+                    favorites = favorites.filter { !identityIDs.contains($0.stationID) }
+                        + confirmedFavorites.filter { identityIDs.contains($0.stationID) }
+                    rebuildFavorites()
+                    persistCarPlaySnapshot()
+                    if confirmedSave {
+                        errorMessage = nil
+                        noticeMessage = "Saved charger added; confirmation was interrupted."
+                    } else {
+                        show(operationError)
+                    }
+                } catch {
+                    guard isCurrentAccount(accountRevision, userID: userID) else { return }
+                    // The POST may have committed; hide the unverified optimistic row until account sync.
+                    favorites.removeAll { $0.stationID == station.id }
+                    rebuildFavorites()
+                    persistCarPlaySnapshot()
+                    requireAccountRetry(.accountData)
+                    errorMessage = "Saved chargers could not be verified. Reload account data to check them."
+                }
+                return
             }
             rebuildFavorites()
             persistCarPlaySnapshot()
